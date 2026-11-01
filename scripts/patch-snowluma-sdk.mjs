@@ -45,4 +45,20 @@ for (const pkg of TARGETS) {
   console.log(`[patch-snowluma] ${pkg}: 修补了 ${patched} 个文件`);
   total += patched;
 }
+
+// 修复 Node 22 原生 WebSocket (Undici) 握手建连失败（如对端尚未监听 3001）时
+// 只触发 error 不触发 close，导致 connectPromise 永远挂起且不自动重连的问题。
+const wsClientFile = path.join(ROOT, 'node_modules', '@snowluma/sdk', 'dist', 'client', 'websocket-client.js');
+if (fs.existsSync(wsClientFile)) {
+  const wsSrc = fs.readFileSync(wsClientFile, 'utf8');
+  const norm = wsSrc.replace(/\r\n/g, '\n');
+  const target = `                addSocketListener(socket, 'error', (error) => {\n                    this.emitter.emit('error', unwrapEventPayload(error));\n                }),`;
+  const replacement = `                addSocketListener(socket, 'error', (error) => {\n                    this.emitter.emit('error', unwrapEventPayload(error));\n                    cleanup.forEach((off) => off());\n                    if (this.socket === socket) {\n                        this.connectPromise = null;\n                        this.socket = null;\n                        reject(new SnowLumaConnectionError('SnowLuma WebSocket error before opening'));\n                        this.handleClose([{ code: 1006, reason: 'handshake-error' }]);\n                    }\n                }),`;
+  if (norm.includes(target)) {
+    fs.writeFileSync(wsClientFile, norm.replace(target, replacement));
+    console.log('[patch-snowluma] 已修补 websocket-client.js 握手失败重连挂死 bug');
+    total += 1;
+  }
+}
+
 console.log(`[patch-snowluma] 合计 ${total} 个文件`);

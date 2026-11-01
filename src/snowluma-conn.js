@@ -50,6 +50,10 @@ export function readOneBotTokens(homeDir) {
   } catch {
     return [];
   }
+  const normHost = (h) => {
+    const s = String(h || '').trim();
+    return (!s || s === '0.0.0.0' || s === '::' || s === '[::]') ? '127.0.0.1' : s;
+  };
   const out = [];
   for (const e of entries) {
     if (!e.isFile()) continue;
@@ -63,8 +67,8 @@ export function readOneBotTokens(homeDir) {
       out.push({
         uin: m[1],
         file: path.join(dir, e.name),
-        http: http ? { token: String(http.accessToken ?? ''), host: http.host || '127.0.0.1', port: Number(http.port) || 3000 } : null,
-        ws: ws ? { token: String(ws.accessToken ?? ''), host: ws.host || '127.0.0.1', port: Number(ws.port) || 3001 } : null
+        http: http ? { token: String(http.accessToken ?? ''), host: normHost(http.host), port: Number(http.port) || 3000 } : null,
+        ws: ws ? { token: String(ws.accessToken ?? ''), host: normHost(ws.host), port: Number(ws.port) || 3001 } : null
       });
     } catch {
       // 单个文件坏了不影响其它账号
@@ -115,6 +119,7 @@ export async function discoverSnowLumaConnection({
   timeoutMs = 6000
 } = {}) {
   const sl = cfg?.snowluma ?? cfg ?? {};
+  const targetUin = sl.targetUin ? String(sl.targetUin).trim() : '';
   const base = String(baseUrl || process.env.SNOWLUMA_HTTP_URL || sl.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
   const homes = homeDirs ?? snowLumaHomeCandidates({ cfg });
   const explicit = token || process.env.SNOWLUMA_TOKEN || sl.accessToken || '';
@@ -130,10 +135,11 @@ export async function discoverSnowLumaConnection({
   };
   if (explicit) add(explicit, 'config/env', base);
   // per-account 文件：同时收 HTTP token（工具用）与 WS 信息（桥接用）。
-  // 两个 token 不同、端口也各自记录，不能混用。
+  // 两个 token 不同、端口也各自记录，不能混用。若配置了 targetUin，只采纳目标机器人账号。
   const wsInfo = new Map();   // uin -> { token, url }
   for (const home of homes) {
     for (const entry of readOneBotTokens(home)) {
+      if (targetUin && entry.uin !== targetUin) continue;
       if (entry.http) add(entry.http.token, `onebot_${entry.uin}.json`, `http://${entry.http.host}:${entry.http.port}`);
       if (entry.ws?.token) wsInfo.set(entry.uin, { token: entry.ws.token, url: `ws://${entry.ws.host}:${entry.ws.port}` });
     }
@@ -143,6 +149,11 @@ export async function discoverSnowLumaConnection({
   const tried = [];
   for (const c of candidates) {
     const r = await probe(c.url, c.token, timeoutMs);
+    const probedUin = String(r.data?.user_id ?? '');
+    if (r.ok && targetUin && probedUin && probedUin !== targetUin) {
+      tried.push({ source: c.source, url: c.url, token: c.token ? c.token.slice(0, 4) + '…' : '(空)', ok: false, status: 403, wording: `账号不匹配(${probedUin}!=${targetUin})` });
+      continue;
+    }
     tried.push({ source: c.source, url: c.url, token: c.token ? c.token.slice(0, 4) + '…' : '(空)', ok: r.ok, status: r.status, wording: r.wording });
     if (r.ok) {
       // 找到有效 HTTP token 后，把**同一个账号**的 WS 信息也带回去：

@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "qq-bridge": {
+      "command": "node",
+      "args": [
+        "<QQ_BRIDGE_DIR>\\src\\mcp-snowluma-safe.js"
+      ],
+      "env": {}
+    }
+  }
+}

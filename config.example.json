@@ -19,9 +19,34 @@
     "followDiscoveredEndpoint": true,
     "silenceWarnMs": 600000,
     "launcherPath": "",
-    "homeDir": ""
+    "homeDir": "",
+    "targetUin": ""
   },
   "ownerQQ": null,
+  "persona": {
+    "botName": "Bot",
+    "nameKeywords": [],
+    "ambiguousKeywords": [],
+    "creatorUids": [],
+    "creatorLabel": "Creator",
+    "creatorNickKeywords": [],
+    "selfImage": "assets/deepseek娘.png",
+    "selfRefs": [],
+    "appearanceAnchor": [],
+    "memoryCompartments": {}
+  },
+  "napcat": {
+    "dir": "",
+    "account": "",
+    "dataDir": "",
+    "userDataDir": "",
+    "onebotConfig": "",
+    "webuiConfigPath": "",
+    "nodeExe": ""
+  },
+  "codexDraw": {
+    "invokeScript": "scripts/Invoke-CodexImage.ps1"
+  },
   "sessionCwd": "",
   "agentPreset": "qq-chat",
   "workspaceTitle": "QQ 聊天",
@@ -181,7 +206,12 @@
       "maxWakePerMinute": 1,
       "maxWakePerHour": 12,
       "noActionLimit": 3,
-      "maxWakeConfigReminders": 2
+      "maxWakeConfigReminders": 2,
+      "maxConcurrentTurns": 1,
+      "allowedWorkers": [
+        "w1",
+        "w2"
+      ]
     },
     "send": {
       "burstEnabled": true,
@@ -263,6 +293,20 @@
       "gifFrames": 6,
       "gifTile": 240,
       "normalizeTimeoutMs": 25000
+    },
+    "tts": {
+      "enabled": false,
+      "provider": "google",
+      "fallbackProvider": "google",
+      "elevenlabs": {
+        "voiceId": "",
+        "modelId": "eleven_v3",
+        "outputFormat": "mp3_44100_128",
+        "languageCode": "zh"
+      },
+      "google": {
+        "lang": "zh-CN"
+      }
     }
   },
   "webSearch": {

@@ -66,3 +66,11 @@ docs/guides/VOICE.md
 # 语音库（用户个人音频素材，config.json 的 socialV2.voice.dir 指向此处）
 audio/
 
+
+# ── Antigravity 分支：个人运行数据（不入库）────────────────────────────────
+# 分舱长期记忆、收藏/自制表情、个人形象图都属于部署者自己的数据。
+memory/*
+!memory/README.md
+stickers/*
+!stickers/README.md
+assets/self*.png

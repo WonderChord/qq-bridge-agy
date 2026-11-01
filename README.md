@@ -7,6 +7,10 @@
 > 🔒 QQ 会话的权限边界与安全承诺见 **[RULES.md](RULES.md)**。
 >
 > 🎤 独立的「发语音」工具已拆到仓库上一级的 **`../voice-tool/`**（命令行 `voice-cli.mjs` / 图形界面 `voice-gui.mjs`），不再依赖 qq-bridge 运行。
+>
+> 🛰️ **本分支新增 Antigravity 后端**：`dsh.baseUrl = "agy://local"` 后由 Antigravity 子代理接管聊天（单 Worker + Flash 预筛 + Flash 记忆归纳），并支持无头 NapCat 守护、ElevenLabs / Google TTS 语音条、Codex 外包画图与按会话分舱的长期记忆。配置与插件安装见 **[docs/guides/ANTIGRAVITY.md](docs/guides/ANTIGRAVITY.md)**。
+>
+> 🤖 **纯 Vibe Coding 免责声明**：本分支新增的 Antigravity 后端、无头 NapCat 自愈守护、三子代理省流架构、TTS 语音条与外包生图等改造**全程由 AI 辅助（纯 Vibe Coding）生成与迭代**，按原样（"AS IS"）基于 MIT 协议开源分享，仅供个人学习、整活与技术交流。作者不对代码质量、稳定性、Token 账单消耗、第三方接口变动或 QQ 账号风控承担任何担保或连带责任，使用前请自行审阅配置并自担风险。
 
 把 QQ 消息接入 DSH agent：QQ 好友/群发来的消息会变成 DSH 会话里的用户消息，agent 的回复（含提问、工具审批）会发回 QQ。
 
@@ -46,10 +50,28 @@
 > 默认分支 `main` **就是**本版本，`git clone` 直接拿到，无需切换分支。
 
 ```
-QQ 消息 ──► SnowLuma（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API (127.0.0.1:3080/api)
-                                                ▲                      │
-                                                └── agent 回复/提问/审批 ┘
+QQ 消息 ──► SnowLuma / NapCat（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API (127.0.0.1:3080/api)
+                                                        │   └──► 或 Antigravity (dsh.baseUrl = "agy://local")
+                                                        ▲                      │
+                                                        └── agent 回复/表情/语音/生图 ┘
 ```
+
+## Antigravity (AGY) + 无头 NapCat 全自动值守模式（v0.3.0 新增）
+
+除原有的 DeepSeek Harness（DSH）后端外，本仓库现原生支持 **Google Antigravity (AGY)** 零轮询阻塞唤醒后端与 **无头 NapCat** 守护模式（同为 MIT 开源，所有角色设定、触发词与分舱记忆均已抽离为 `config.json` 配置项）：
+
+- **超省流三子代理架构（`agy-plugin/` 一键安装）**：
+  1. **`qq-chat-worker`（`w1` 聊天主线程）**：单线程承接全部唤醒以保持 5 分钟 KV Cache 持续命中（网桥内置 2s 合批与 72% 极简唤醒头压缩），通过 `scripts/agy-reply-and-wait.mjs` **单条命令**同时完成「发文字 / 批量引用回多人 / 发表情包 / 发 TTS 语音条 / 触发 Codex 画图 / 偷表情包 / 标已读并挂起等下一轮」，满 **25 轮**自动无状态换新。
+  2. **`qq-flash-judge`（Flash 前置预筛线程）**：网桥先在零 Token 层滤除纯图/单字/纯表情废话，仅对模糊称呼（`persona.ambiguousKeywords`）与潜水 `0.12` 概率抽样拉取最近 14 条上下文交由 Flash 极速二分类（`yes/no`），满 **30 轮**自动换新。
+  3. **`qq-memory-archivist`（Flash 旁路分舱记忆归纳线程）**：按 `persona.memoryCompartments` 物理隔离各群聊与私聊记忆，群聊每满 150 条 / 私聊每满 40 条异步归纳至 `<dir>/summary.md` 与 `<dir>/diary/`，严禁跨群串台。
+- **双通道免部署 TTS 语音条（`/api/socialV2/send-tts` & `--tts`）**：
+  - 主通道支持 **ElevenLabs**（读取环境变量 `ELEVENLABS_API_KEY`，支持 `eleven_v3` 等多语种模型），兜底/免配置通道支持 **Google TTS**（`translate.googleapis.com` GTX 接口，免 Key 直出），合成后经 `ffmpeg` 与 OneBot `record` 段直发原生 QQ 手机端可点播的 SILK 语音气泡。
+- **Codex CLI (GPT Image 2.5) 外包生图/自画像（`/api/socialV2/codex-draw` & `--codex-draw`）**：
+  - 复用本机已登录 ChatGPT 会员的 Codex CLI 异步生图（仅对 `persona.creatorUids` 开放），画机器人自画像时自动挂载 `persona.selfRefs` 参考图与 `persona.appearanceAnchor` 外观锚点，后台生图完成后自动引用发送。
+- **无头 NapCat 内核假死探测与无窗自愈（`scripts/ensure-daemons.ps1`）**：
+  - 针对 NTQQ MSF 断流假死时 `/get_status` 仍虚报 `online: true` 的问题，内置 `get_stranger_info(no_cache: true)` 实时内核探针；超时自动通过 WMI `ShowWindow=0` 零弹窗重启无头 NapCat 并调用 `napcat-auto-relogin.mjs` 走 `SetQuickLogin` 免密重连（永久移除明文密码登录回退，避免触发滑块风控）。
+
+> 📖 Antigravity 后端的完整配置、插件安装与启动流程见 **[docs/guides/ANTIGRAVITY.md](docs/guides/ANTIGRAVITY.md)**。
 
 ## 项目展示
 
@@ -140,6 +162,10 @@ npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk �
 | `sendDelayMs` | QQ 连续发送间隔，防止触发频率限制 |
 | `consolePort` | 本地控制台端口，默认 `3100` |
 | `consoleToken` | 控制台访问令牌；留空时启动自动生成并保存到 `state/console-token` |
+| `persona` | **（AGY 模式可选）** 机器人身份与分舱记忆配置：`botName`（自称）、`nameKeywords`（点名关键词）、`ambiguousKeywords`（交由 Flash 预筛的模糊外号）、`creatorUids`（允许调用外包画图的创作者 QQ 列表）、`selfImage` / `selfRefs` / `appearanceAnchor`（自画像参考图与外观锚点）、`memoryCompartments`（各会话分舱长期记忆目录与触发阈值） |
+| `napcat` | **（无头 NapCat 可选）** `ensure-daemons.ps1` 与 `napcat-auto-relogin.mjs` 读取的目录与账号配置（`dir`、`account`、`dataDir`、`userDataDir`、`onebotConfig`、`webuiConfigPath`） |
+| `socialV2.tts` | **（TTS 语音条可选）** `provider`（`"elevenlabs"` 或 `"google"`）、`fallbackProvider`（默认 `"google"`）、`elevenlabs.voiceId` / `modelId`（默认 `eleven_v3`，API Key 从环境变量 `ELEVENLABS_API_KEY` 读取） |
+| `codexDraw` | **（外包生图可选）** `invokeScript` 默认指向随仓附带的 `scripts/Invoke-CodexImage.ps1` |
 
 > ⚠️ `allowAllWhenEmpty: true` 表示「白名单没填就全部放行」——把 agent 接入 QQ 等于把账号控制权交给了模型，建议先填白名单。
 

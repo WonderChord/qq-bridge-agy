@@ -85,7 +85,9 @@ SOFTWARE.
 | --- | --- | --- | --- |
 | **本机 DSH**（默认 `127.0.0.1:3080`） | 群/私聊消息文本、图片、昵称、会话上下文 | 开 | 不运行 DSH 就没有这个桥接的意义 |
 | **LLM 提供方**（经 DSH 调用，默认 provider `deepseek-official`） | 同上——**包括群里其他人的消息**（旁观者数据） | 开 | 在 DSH 里换 provider/model；或不用本程序 |
-| **OneBot 网关**（默认 `127.0.0.1:3000/3001`） | 你发出的消息、动作参数 | 开 | 不接 QQ 就没有这个程序的意义 |
+| **OneBot 网关**（SnowLuma 或 NapCat，默认 `127.0.0.1:3000/3001`） | 你发出的消息、动作参数 | 开 | 不接 QQ 就没有这个程序的意义 |
+| **本机 Antigravity 子代理**（仅当 `dsh.baseUrl = "agy://local"` 时） | 唤醒快照、最近消息、分舱记忆与图片落盘路径（通过 `127.0.0.1:3100/api/agy/*` 本地回环通信） | 关（默认走 DSH） | 不将 `dsh.baseUrl` 设为 `agy://local` |
+| **ElevenLabs / Google TTS 接口**（仅当启用 `socialV2.voice.enabled` 且调用 `/api/socialV2/send-tts` 或 `--tts` 时） | 要合成为语音气泡的单条短句台词（发往 `api.elevenlabs.io` 或 `translate.googleapis.com`） | **关** | 默认 `socialV2.voice.enabled: false`，不传 `--tts` 即不出机 |
 | ⚠️ **`web_search` → DeepSeek 联网搜索接口**（默认；与 LLM 同一提供方）/ **Bing**（仅 DeepSeek 不可用时兜底） | **搜索关键词**。**黑话学习默认开启**（`slang.autoResearch: true`），会把**从群聊里提取的词条**作为关键词发出去 | **开** | 不挂载 `mcp-web-search-safe`，或在控制台关掉黑话自动研究 |
 | ⚠️ **`web_fetch` → 任意公网 URL** | 被抓取的页面地址（由模型决定，可能包含从聊天内容里得到的线索） | **开** | 同上（`safe-fetch.js` 只拦内网/私有地址，公网都放行） |
 

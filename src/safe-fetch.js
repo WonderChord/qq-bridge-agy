@@ -150,7 +150,10 @@ export async function resolveSafeAddresses(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
+  const isTrustedQqMediaHost = /(^|\.)(qq\.com|qq\.com\.cn|qpic\.cn|gtimg\.cn)$/i.test(h);
+  const isTunFakeIp = (addr) => /^198\.(18|19)\.\d+\.\d+$/.test(String(addr || ''));
   for (const { address } of addresses) {
+    if (isTrustedQqMediaHost && isTunFakeIp(address)) continue;
     if (isPrivateIp(address)) {
       throw new Error('域名解析到内网/本机地址，已阻止');
     }

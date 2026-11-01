@@ -1,0 +1,11 @@
+{
+  "name": "qq-bridge",
+  "displayName": "QQ Bridge (NapCat)",
+  "description": "NapCat OneBot v11 与 Antigravity 之间的 QQ 机器人桥接插件：零轮询唤醒、单聊天 Worker + Flash 预筛 + Flash 记忆归纳三线程值守。",
+  "version": "0.3.0",
+  "suggestedPrompts": [
+    "启动 QQ 机器人全自动值守",
+    "查看 QQ 桥接与 NapCat 当前连接状态",
+    "归纳近期 QQ 群聊话题记忆"
+  ]
+}
