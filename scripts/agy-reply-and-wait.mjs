@@ -149,13 +149,22 @@ async function main() {
   const cfg = loadConfig();
   const port = Number(cfg.consolePort) || 3100;
   const consoleToken = readConsoleToken(cfg);
+  const finishTurnForWait = opts.finishTurn;
   if (opts.finishTurn && opts.key) {
-    const claim = await postBridge(port, consoleToken, '', '/api/agy/claim', {
-      key: opts.key, token: opts.token, workerId: opts.workerId, turn: opts.finishTurn,
-    });
-    if (claim.duplicate) {
-      console.log('[agy-reply-and-wait] 此回合已有回复任务，重复调用已忽略。');
-      return;
+    try {
+      const claim = await postBridge(port, consoleToken, '', '/api/agy/claim', {
+        key: opts.key, token: opts.token, workerId: opts.workerId, turn: opts.finishTurn,
+      });
+      if (claim.duplicate) {
+        console.log('[agy-reply-and-wait] 此回合已有回复任务，重复调用已忽略。');
+        if (!opts.noWait) {
+          await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, finishTurnForWait, opts.maxTurns);
+        }
+        return;
+      }
+    } catch (err) {
+      console.error(`[agy-reply-and-wait] claim 警告 (${err?.message ?? err})，降级为无 turn 直发并继续监听`);
+      opts.finishTurn = '';
     }
   }
   let failed = false;
@@ -396,13 +405,15 @@ async function main() {
   }
 
   if (opts.noWait) {
-    await postBridge(port, consoleToken, '', '/api/agy/complete', { workerId: opts.workerId, turn: opts.finishTurn });
+    if (finishTurnForWait) {
+      await postBridge(port, consoleToken, '', '/api/agy/complete', { workerId: opts.workerId, turn: finishTurnForWait }).catch(() => {});
+    }
     console.log('[agy-reply-and-wait] 回合已结束（--no-wait）');
     process.exitCode = failed ? 1 : 0;
     return;
   }
 
-  await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, opts.finishTurn, opts.maxTurns);
+  await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, finishTurnForWait, opts.maxTurns);
 }
 
 main().catch((err) => {

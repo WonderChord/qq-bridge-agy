@@ -1,5 +1,6 @@
-﻿param(
-  [switch]$ForceRestartNapCat
+param(
+  [switch]$ForceRestartNapCat,
+  [switch]$ForceRestartBridge
 )
 
 # 守护脚本：确保无头 NapCat（:3000 / WebUI :6099）与 qq-bridge（:3100）在线，全部无窗口启动。
@@ -151,6 +152,11 @@ if ($ForceRestartNapCat -or (-not $portsAlive)) {
 }
 
 # 2. Ensure qq-bridge (127.0.0.1:3100)
+if ($ForceRestartBridge -and (Test-LocalPort $consolePort)) {
+  Write-Host '[ensure-daemons] ForceRestartBridge: stopping existing qq-bridge...'
+  & $NodeExe "$BridgeDir\scripts\manage-bridge.mjs" stop | Out-Host
+  Start-Sleep -Milliseconds 500
+}
 if (-not (Test-LocalPort $consolePort)) {
   Write-Host '[ensure-daemons] Starting hidden qq-bridge (src/bridge.js) via WMI (ShowWindow=0)...'
   $bridgeCmd = "`"$NodeExe`" `"$BridgeDir\src\bridge.js`""
