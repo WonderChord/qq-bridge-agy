@@ -6747,13 +6747,15 @@ async function main() {
         }
 
         if (req.method === 'POST' && url.pathname === '/api/socialV2/send-tts') {
-          if (!voiceEnabled()) { sendJson({ ok: false, error: '语音体系已关闭' }, 403); return; }
+          const voice = voiceCfg();
+          if (!voice.enabled) { sendJson({ ok: false, error: '语音体系已关闭' }, 403); return; }
           const body = await readBody();
           const key = String(body.key ?? '').trim();
           const text = String(body.text ?? body.message ?? '').trim();
+          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
           if (!key || !text) { sendJson({ ok: false, error: 'key 和 text 不能为空' }, 400); return; }
-          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (token && token !== '-' && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (token && token !== '-' && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
           if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
           try {
             const ttsCfg = cfg.socialV2?.tts ?? {};
@@ -6768,7 +6770,17 @@ async function main() {
               try {
                 if (prov === 'elevenlabs') {
                   const elCfg = ttsCfg.elevenlabs ?? {};
-                  const apiKey = String(elCfg.apiKey || process.env.ELEVENLABS_API_KEY || '').trim();
+                  let apiKey = String(elCfg.apiKey || process.env.ELEVENLABS_API_KEY || '').trim();
+                  if (!apiKey && process.platform === 'win32') {
+                    try {
+                      const regOut = execFileSync('reg.exe', ['query', 'HKCU\\Environment', '/v', 'ELEVENLABS_API_KEY'], { encoding: 'utf8', windowsHide: true });
+                      const m = /ELEVENLABS_API_KEY\s+REG_\w+\s+([^\r\n]+)/i.exec(regOut);
+                      if (m?.[1]) {
+                        apiKey = m[1].trim();
+                        process.env.ELEVENLABS_API_KEY = apiKey;
+                      }
+                    } catch {}
+                  }
                   if (!apiKey) throw new Error('ELEVENLABS_API_KEY 未配置');
                   const voiceId = String(body.voiceId || elCfg.voiceId || '').trim();
                   if (!voiceId) throw new Error('未配置 socialV2.tts.elevenlabs.voiceId');
@@ -6786,22 +6798,34 @@ async function main() {
                   if (elCfg.languageCode && !modelId.includes('v3')) {
                     payload.language_code = String(elCfg.languageCode);
                   }
-                  const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
-                    method: 'POST',
-                    headers: {
-                      'xi-api-key': apiKey,
-                      'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify(payload),
-                    signal: AbortSignal.timeout(18000)
-                  });
-                  if (!r.ok) {
-                    const errTxt = await r.text().catch(() => '');
-                    throw new Error(`ElevenLabs HTTP ${r.status}: ${errTxt.slice(0, 180)}`);
+                  let elErr = null;
+                  for (let attempt = 1; attempt <= 2; attempt++) {
+                    try {
+                      const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
+                        method: 'POST',
+                        headers: {
+                          'xi-api-key': apiKey,
+                          'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload),
+                        signal: AbortSignal.timeout(25000)
+                      });
+                      if (!r.ok) {
+                        const errTxt = await r.text().catch(() => '');
+                        throw new Error(`ElevenLabs HTTP ${r.status}: ${errTxt.slice(0, 180)}`);
+                      }
+                      const buf = Buffer.from(await r.arrayBuffer());
+                      if (buf.length < 256) throw new Error('ElevenLabs 返回音频过小');
+                      audioBuf = buf;
+                      usedProvider = `elevenlabs(${voiceId}/${modelId})`;
+                      elErr = null;
+                      break;
+                    } catch (err) {
+                      elErr = err;
+                      if (attempt < 2) await new Promise((res) => setTimeout(res, 600));
+                    }
                   }
-                  audioBuf = Buffer.from(await r.arrayBuffer());
-                  if (audioBuf.length < 256) throw new Error('ElevenLabs 返回音频过小');
-                  usedProvider = `elevenlabs(${voiceId}/${modelId})`;
+                  if (elErr) throw elErr;
                   break;
                 } else if (prov === 'google') {
                   const gCfg = ttsCfg.google ?? {};
@@ -6818,6 +6842,7 @@ async function main() {
                   break;
                 }
               } catch (e) {
+                log(`[tts] ${prov} 合成失败 (${key}): ${e?.message ?? e}`);
                 lastErr = e;
               }
             }
@@ -6826,7 +6851,7 @@ async function main() {
               throw lastErr || new Error('TTS 合成失败');
             }
 
-            const ttsDir = path.join(ROOT_DIR, 'audio');
+            const ttsDir = voice.dir || path.join(ROOT, 'audio');
             fs.mkdirSync(ttsDir, { recursive: true });
             const fileName = `_tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp3`;
             const filePath = path.join(ttsDir, fileName);
@@ -6834,9 +6859,11 @@ async function main() {
 
             try {
               const sent = await sendVoiceForV2(key, fileName, {
-                source: 'agent_v2_tts',
-                turn: body.turn ?? null
+                label: `[语音] ${text.slice(0, 80)}`,
+                verify: body.verify
               });
+              log(`[tts] ${key} 已发送 TTS 语音 (${usedProvider}, ${audioBuf.length}B): ${text.slice(0, 60)}`);
+              appendActivity(`${key} [tts] 发送语音 (${usedProvider}): ${text.slice(0, 60)}`);
               sendJson({
                 ok: true,
                 key,
@@ -6850,6 +6877,7 @@ async function main() {
               setTimeout(() => { try { fs.unlinkSync(filePath); } catch {} }, 15000);
             }
           } catch (error) {
+            log(`[tts] ${key} 发送失败: ${error?.message ?? error}`);
             sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
           }
           return;
