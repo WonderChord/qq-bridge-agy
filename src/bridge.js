@@ -55,6 +55,8 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
+import { synthesizeSpeech } from './tts.js';
+import { napcatLoginConfig } from './napcat-config.js';
 import { runCodexDraw } from '../scripts/agy-codex-draw.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -678,6 +680,8 @@ function loadConfig() {
       ...(file.dsh ?? {})
     },
     snowluma: { wsUrl: 'ws://127.0.0.1:3001', accessToken: '', ...(file.snowluma ?? {}) },
+    persona: file.persona ?? {},
+    napcat: file.napcat ?? {},
     // 空 => 每个会话在 state/agents/<key> 下建独立工作目录
     sessionCwd: file.sessionCwd ?? '',
     agentPreset: file.agentPreset ?? 'qq-chat',
@@ -947,13 +951,6 @@ function loadConfig() {
     maxListCount: 100,
     includeInPrompt: true,
     promptMaxStickers: 8,
-    collect: {
-      enabled: true,
-      maxPerMinute: 2,
-      maxPerHour: 10,
-      maxRemarkChars: 20,
-      ...((cfg.socialV2?.sticker?.collect) ?? {})
-    },
     ...(cfg.socialV2?.sticker ?? {}),
     collect: {
       enabled: true,
@@ -1680,6 +1677,7 @@ async function main() {
   //                  但仍强制白名单 + 语音限流 + 敏感词审计。
   // 语音发送时间戳（scopeKey → number[]）：与文本发送分开计数，语音额度独立。
   const voiceSendTimes = new Map();
+  const voiceSendsPending = new Map();
 
   /**
    * 出站语音的内容审计：与文本一致，凡是「疑似敏感信息 / 含会话令牌」的**文件名**
@@ -1710,6 +1708,18 @@ async function main() {
       ffmpegPath: process.env.FFMPEG_PATH || v.ffmpegPath || null,
       autoReadback: v.autoReadback !== false
     };
+  }
+
+  function ttsEnabled() {
+    const tts = cfg.socialV2?.tts;
+    return tts?.enabled === true || (tts?.enabled == null && !!tts?.provider);
+  }
+
+  function consoleSocialV2Config() {
+    const config = cfg.socialV2;
+    if (!config.tts?.elevenlabs) return config;
+    const { apiKey, ...elevenlabs } = config.tts.elevenlabs;
+    return { ...config, tts: { ...config.tts, elevenlabs } };
   }
 
   function voiceLibrary() {
@@ -1841,11 +1851,12 @@ async function main() {
     const bucket = voiceSendTimes.get(scopeKey) ?? [];
     const inMinute = bucket.filter((t) => now - t < 60000);
     const inHour = bucket.filter((t) => now - t < 3600000);
-    if (cfgV.maxPerMinute > 0 && inMinute.length + 1 > cfgV.maxPerMinute) {
-      throw new Error(`语音发送频率超限（每分钟最多 ${cfgV.maxPerMinute} 条），请稍后再试`);
+    const needed = (voiceSendsPending.get(scopeKey) || 0) + 1;
+    if (cfgV.maxPerMinute > 0 && inMinute.length + needed > cfgV.maxPerMinute) {
+      throw Object.assign(new Error(`语音发送频率超限（每分钟最多 ${cfgV.maxPerMinute} 条），请稍后再试`), { statusCode: 429 });
     }
-    if (cfgV.maxPerHour > 0 && inHour.length + 1 > cfgV.maxPerHour) {
-      throw new Error(`语音发送频率超限（每小时最多 ${cfgV.maxPerHour} 条），请稍后再试`);
+    if (cfgV.maxPerHour > 0 && inHour.length + needed > cfgV.maxPerHour) {
+      throw Object.assign(new Error(`语音发送频率超限（每小时最多 ${cfgV.maxPerHour} 条），请稍后再试`), { statusCode: 429 });
     }
   }
 
@@ -1892,7 +1903,7 @@ async function main() {
     }
     const sendPath = processed.path;
 
-    const assertSendAllowed = guard ? captureSendGuard(key) : null;
+    const assertSendAllowed = typeof guard === 'function' ? guard : (guard ? captureSendGuard(key) : null);
     const [kind, id] = key.split(':');
     const recordSegment = { type: 'record', data: { file: sendPath } };
     let resolveSend;
@@ -2014,15 +2025,23 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null } = {}) {
+  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, prepare, guard = captureSendGuard(key) } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
-    const resolved = resolveVoicePathForV2(voiceRef);
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
     voiceBudgetCheck(key, vc);
-    const sent = await sendVoiceV2(key, resolved.path, { guard: true, audit: true, audio });
-    voiceBudgetCommit(key);
+    voiceSendsPending.set(key, (voiceSendsPending.get(key) || 0) + 1);
+    let resolved, sent;
+    try {
+      resolved = prepare ? { path: await prepare(), via: 'tts' } : resolveVoicePathForV2(voiceRef);
+      sent = await sendVoiceV2(key, resolved.path, { guard, audit: true, audio });
+      voiceBudgetCommit(key);
+    } finally {
+      const pending = voiceSendsPending.get(key) - 1;
+      if (pending) voiceSendsPending.set(key, pending);
+      else voiceSendsPending.delete(key);
+    }
     recordVoiceSentV2(key, sent, label);
     log(`[voice] ${key} 已发送语音 ${path.basename(resolved.path)} (${sent.detail}, messageId=${sent.messageId ?? '?'})`);
     appendActivity(`${key} [voice] 发送语音 ${path.basename(resolved.path)} (${sent.detail})`);
@@ -2872,7 +2891,7 @@ async function main() {
   let dshReady = false;
   let dshCheckStarted = false;
   let snowlumaWatchStarted = false; // SnowLuma 上游健康探测只启动一次（见 startSnowlumaWatch）
-  let currentMode = 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
+  let currentMode = api.isAgyBackend ? 'reserved2' : 'chat'; // chat | closed-agent | reserved（仿真模式，由 DSH settings / state/mode.json 驱动）
   let lastMode = currentMode;
   // closed-agent 模式使用的 DSH agent preset：留空表示「用 DSH 自己声明的默认 preset」。
   // 旧版本这里硬编码 'router-standard'，但 DSH 0.1.5 已移除该 preset，硬编码会导致
@@ -3395,7 +3414,8 @@ async function main() {
    */
   async function probeNapcatKernelAlive() {
     const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
-    const targetUin = Number(cfg.snowluma?.targetUin || selfUserId || 10000);
+    const targetUin = Number(cfg.snowluma?.targetUin || cfg.napcat?.account || selfUserId);
+    if (!targetUin) return true; // 尚未识别本机账号，等下个探测周期。
     try {
       const res = await fetch(`${httpUrl}/get_stranger_info`, {
         method: 'POST',
@@ -3486,30 +3506,25 @@ async function main() {
     const now = Date.now();
     if (napcatAutoReloginInFlight || now - lastNapcatAutoReloginAt < 25_000) return;
     const authFile = path.join(STATE_DIR, 'napcat-auth.json');
-    if (!fs.existsSync(authFile)) return;
+    if (!cfg.napcat.account && !fs.existsSync(authFile)) return;
     napcatAutoReloginInFlight = true;
     lastNapcatAutoReloginAt = now;
     try {
-      const auth = JSON.parse(fs.readFileSync(authFile, 'utf8'));
-      // NapCat WebUI 配置（config.json → napcat.webuiConfigPath，形如 <NapCat>/versions/<ver>/resources/app/napcat/config/webui.json）
-      const webuiCfgPath = String(cfg.napcat?.webuiConfigPath || '');
-      let webuiUrl = auth.webuiUrl || 'http://127.0.0.1:6099';
-      let webuiToken = auth.webuiToken || '';
-      try {
-        if (webuiCfgPath && fs.existsSync(webuiCfgPath)) {
-          const wcfg = JSON.parse(fs.readFileSync(webuiCfgPath, 'utf8'));
-          if (wcfg.token) webuiToken = wcfg.token;
-          if (wcfg.port) webuiUrl = `http://${wcfg.host || '127.0.0.1'}:${wcfg.port}`;
-        }
-      } catch {}
+      const auth = napcatLoginConfig(ROOT, cfg.napcat);
+      const { webuiUrl, webuiToken } = auth;
       const hash = crypto.createHash('sha256').update(`${webuiToken}.napcat`).digest('hex');
-      const loginRes = await fetch(`${webuiUrl}/api/auth/login`, {
-        method: 'POST',
+      const response = await fetch(`${webuiUrl}/api/auth/login`, {
+        method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ hash }),
         signal: AbortSignal.timeout(8000),
-      }).then((r) => r.json()).catch(() => null);
+      }).catch(() => null);
+      const loginRes = await response?.json().catch(() => null);
       const cred = loginRes?.data?.Credential;
+      if (response && !cred) {
+        log(`[NapCat自愈] WebUI 已响应，鉴权失败（HTTP ${response.status}），请检查 webuiConfigPath / token`);
+        return;
+      }
 
       // 情况 A：连 WebUI (6099) 都连不上，或确认是 NTQQ 内核假死（WebUI 仍假报 isLogin=true 但内核 no_cache 探针连续超时）
       if (!cred) {
@@ -3523,7 +3538,7 @@ async function main() {
       }
 
       const postApi = (ep, body = {}) => fetch(`${webuiUrl}${ep}`, {
-        method: 'POST',
+        method: 'POST', redirect: 'error',
         headers: { 'content-type': 'application/json', authorization: `Bearer ${cred}` },
         body: JSON.stringify(body),
         signal: AbortSignal.timeout(15000),
@@ -3607,8 +3622,8 @@ async function main() {
   const AMBIGUOUS_CALL_RE = { test: (text) => !!keywordRegExp(personaCfg().ambiguousKeywords)?.test(String(text ?? '')) };
   const CREATOR_UIDS = {
     has: (uid) => {
-      const list = Array.isArray(personaCfg().creatorUids) ? personaCfg().creatorUids : (cfg.ownerQQ ? [cfg.ownerQQ] : []);
-      return list.map(String).includes(String(uid ?? ''));
+      const list = normalizeIdList(personaCfg().creatorUids);
+      return list.length ? list.includes(String(uid)) : !!cfg.ownerQQ && String(cfg.ownerQQ) === String(uid);
     }
   };
   let codexDrawInFlight = 0;
@@ -3839,7 +3854,7 @@ async function main() {
 
   function maybeEnqueueMemoryArchiveV2(key, st, { force = false, minMessages = 10, triggerReason = 'periodic' } = {}) {
     const comp = MEMORY_COMPARTMENTS[key];
-    if (!comp || !st) return;
+    if (!api.isAgyBackend || !comp || !st) return;
     const latestSeq = Number(st.lastUnreadSeq) || 0;
     if (!lastArchivedSeqByKey.has(key)) {
       lastArchivedSeqByKey.set(key, latestSeq);
@@ -4279,6 +4294,18 @@ async function main() {
             });
             return;
           }
+          if (req.method === 'POST' && url.pathname === '/api/agy/claim') {
+            const { key, token, turn, workerId } = await readBody();
+            if (!agentTokenOk(key, token) || !v2SessionAllowed(key) || currentMode !== 'reserved2'
+                || socialV2.paused || cfg.socialV2.enabled === false) {
+              sendJson({ ok: false, error: '会话令牌无效或当前不接受回复' }, 403);
+              return;
+            }
+            const result = api.claimTurn(turn, state.sessions[key], workerId);
+            if (result === 'stale') { sendJson({ ok: false, error: '该回合已过期或属于其他 Worker' }, 409); return; }
+            sendJson({ ok: true, duplicate: result === 'duplicate' });
+            return;
+          }
           if (req.method === 'POST' && url.pathname === '/api/agy/complete') {
             const body = await readBody();
             let sessionId = body?.sessionId ? String(body.sessionId) : '';
@@ -4386,8 +4413,15 @@ async function main() {
             });
             return;
           }
+          const agy = api.isAgyBackend ? api.agyStatus() : null;
           sendJson({
             mode: currentMode,
+            pid: process.pid,
+            backend: agy ? 'agy' : 'dsh',
+            ...(agy ? { workers: {
+              waiting: agy.waitingListeners, busy: new Set(agy.activeTurns.map((t) => t.workerId).filter(Boolean)).size,
+              queued: agy.queuedWakes,
+            } } : {}),
             closedAgentPreset,
             role: rs.role ?? null,
             roleMode: rs.mode ?? 'active',
@@ -5346,7 +5380,7 @@ async function main() {
         }
         // ── 二代仿真模式（reserved2）内部 Agent API ─────────────────────────
         if (req.method === 'GET' && url.pathname === '/api/socialV2/config') {
-          sendJson({ ok: true, config: cfg.socialV2 ?? {} });
+          sendJson({ ok: true, config: consoleSocialV2Config() });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/config') {
@@ -5362,11 +5396,30 @@ async function main() {
           // setStickerRemark / sendVoice 静默打开**（它们默认 false 是有意的：一个是风险操作，
           // 一个是需要先准备语音库的强表达）。cfg.socialV2 是「文件 + 默认值」深度合并后的运行时配置，
           // 用它兜底才和真正生效的设置一致（也就不会再出现"文件里没有 → 保存一次就变了"）。
-          const fileV2 = (file.socialV2 && typeof file.socialV2 === 'object' && !Array.isArray(file.socialV2))
-            ? file.socialV2
-            : null;
-          const current = fileV2 ?? ((cfg.socialV2 && typeof cfg.socialV2 === 'object') ? cfg.socialV2 : {});
+          const current = { ...cfg.socialV2, ...file.socialV2, tools: { ...cfg.socialV2.tools, ...file.socialV2?.tools } };
           const merged = { ...current, ...body };
+          for (const sub of ['voice', 'tts']) {
+            if (body[sub] === undefined) continue;
+            const delta = body[sub];
+            if (!delta || typeof delta !== 'object' || Array.isArray(delta)
+                || (delta.enabled !== undefined && typeof delta.enabled !== 'boolean')) {
+              sendJson({ ok: false, error: sub + ' 配置格式无效' }, 400);
+              return;
+            }
+            merged[sub] = { ...cfg.socialV2[sub], ...current[sub], ...delta };
+          }
+          if (body.tts?.provider !== undefined && !['elevenlabs', 'google'].includes(body.tts.provider)) {
+            sendJson({ ok: false, error: 'TTS 提供商应为 google 或 elevenlabs' }, 400);
+            return;
+          }
+          if (body.tts?.elevenlabs !== undefined) {
+            const el = body.tts.elevenlabs;
+            if (!el || typeof el !== 'object' || Array.isArray(el)) {
+              sendJson({ ok: false, error: 'elevenlabs 配置格式无效' }, 400);
+              return;
+            }
+            merged.tts.elevenlabs = { ...current.tts?.elevenlabs, ...el };
+          }
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
           for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
             if (body[sub] !== undefined && (body[sub] === null || typeof body[sub] !== 'object' || Array.isArray(body[sub]))) {
@@ -5512,7 +5565,7 @@ async function main() {
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
           if (wakeDefaultChanged) refreshAllDefaultWakeConfigsV2();
           log('控制台：二代仿真配置已更新');
-          sendJson({ ok: true, config: cfg.socialV2 });
+          sendJson({ ok: true, config: consoleSocialV2Config() });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
@@ -5747,7 +5800,14 @@ async function main() {
           const throughSeq = requestedReadThroughSeqV2(st, body, !!req.headers['x-agent-token']);
           // 如果当前已经是“潜水”唤醒配置，且最近还有对话/刚被唤醒，不允许用 mark_read 直接回到潜水；
           // 必须先等够沉睡前观察窗口，避免“聊两句又去潜水”。
-          if (isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
+          const workerAck = api.isAgyBackend && body.turn && throughSeq != null
+            && api.isTurnActive(body.turn, state.sessions[key] || null);
+          if (api.isAgyBackend && body.turn && !workerAck) {
+            sendJson({ ok: false, error: '回合已结束或会话不匹配，请使用本次唤醒的水位与回合 ID' }, 409);
+            return;
+          }
+          // AGY 已领取回合的确认只推进已展示消息的水位，worker 随即重新监听全桥的唤醒。
+          if (!workerAck && isSleepingConfigV2(st.wakeConfig) && preSleepWaitBlockedV2(st)) {
             const preSleepMs = Math.max(0, Number(cfg.socialV2?.wake?.preSleepWaitMs) || 300000);
             const remaining = Math.max(0, preSleepMs - ((st.lastIncomingAt || 0) ? Date.now() - st.lastIncomingAt : 0));
             const remainMin = Math.ceil(remaining / 60000);
@@ -6519,8 +6579,11 @@ async function main() {
           // 形象图：config.json → persona.selfImage（相对仓库根目录），缺省用 assets/deepseek娘.png
           const selfPath = path.resolve(ROOT, String(personaCfg().selfImage || path.join('assets', 'deepseek娘.png')));
           try {
-            if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: `未找到角色形象图片 ${path.relative(ROOT, selfPath)}` }, 404); return; }
+            if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: '未找到角色形象图片' }, 404); return; }
+            const stat = fs.statSync(selfPath);
+            if (!stat.isFile() || stat.size > MAX_MEDIA_BYTES) { sendJson({ ok: false, error: '角色形象图超出文件限制' }, 400); return; }
             const buf = fs.readFileSync(selfPath);
+            if (!looksLikeImageBuffer(buf)) { sendJson({ ok: false, error: '角色形象图需要 PNG、JPEG、GIF 或 WebP 文件' }, 400); return; }
             const mimeType = mimeFromBuffer(buf) || 'image/png';
             sendJson({ ok: true, key, image: { mimeType, data: buf.toString('base64') } });
           } catch (error) {
@@ -6681,10 +6744,10 @@ async function main() {
         }
 
         // ── 语音发送（AI 通道：reserved2 + agent token，只能发自己那个会话） ────
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-voice') {
+        if (req.method === 'POST' && (url.pathname === '/api/socialV2/send-voice' || url.pathname === '/api/socialV2/send-tts')) {
           const body = await readBody();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          const key = String(body.key ?? body.target ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? body.token ?? '').trim();
+          const key = canonicalV2Key(body.key ?? body.target) || '';
           const voice = voiceCfg();
           if (!voice.enabled) { sendJson({ ok: false, error: '语音功能已关闭' }, 403); return; }
           if (!key) { sendJson({ ok: false, error: 'key 不能为空（格式 group:群号 或 private:QQ号）' }, 400); return; }
@@ -6702,6 +6765,48 @@ async function main() {
             sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
             return;
           }
+          if (socialV2.paused || cfg.socialV2.enabled === false) { sendJson({ ok: false, error: '二代 AI 已暂停或关闭' }, 403); return; }
+          const guardSession = captureSendGuard(key);
+          const isTts = url.pathname === '/api/socialV2/send-tts';
+          const guard = () => {
+            guardSession();
+            if (!agentTokenOk(key, token) || socialV2.paused || cfg.socialV2.enabled === false
+                || shouldBlockSilentReply(key) || !voiceCfg().enabled || !v2ToolEnabled('sendVoice')
+                || (isTts && !ttsEnabled())) {
+              throw Object.assign(new Error('语音发送权限已变化'), { statusCode: 403 });
+            }
+          };
+          if (isTts) {
+            if (!ttsEnabled()) { sendJson({ ok: false, error: 'TTS 已关闭' }, 403); return; }
+            const text = String(body.text ?? body.message ?? '').trim();
+            if (!text || [...text].length > 500) { sendJson({ ok: false, error: 'TTS 台词应为 1~500 字' }, 400); return; }
+            if (SENSITIVE_RE.test(text) || [...KNOWN_AGENT_TOKENS].some((t) => t && text.includes(t))) {
+              sendJson({ ok: false, error: '台词包含敏感信息，已拦截合成' }, 403);
+              return;
+            }
+            const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
+            const ttsDir = path.join(STATE_DIR, 'tts');
+            const filePath = path.join(ttsDir, fileName);
+            let usedProvider;
+            try {
+              const sent = await sendVoiceForV2(key, fileName, {
+                label: '[语音] ' + text.slice(0, 80), verify: body.verify, guard,
+                prepare: async () => {
+                  const result = await synthesizeSpeech(text, cfg.socialV2.tts, body, voice.maxBytes);
+                  usedProvider = result.provider;
+                  fs.mkdirSync(ttsDir, { recursive: true });
+                  fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
+                  return filePath;
+                },
+              });
+              sendJson({ ok: true, key, provider: usedProvider, text, messageId: sent.messageId,
+                file: fileName, verified: sent.verification?.confirmed === true });
+            } finally {
+              // 网关返回消息 ID 后仍可能读取本地音频，给它留出原有的 15 秒窗口。
+              if (fs.existsSync(filePath)) setTimeout(() => { try { fs.unlinkSync(filePath); } catch {} }, 15000).unref();
+            }
+            return;
+          }
           // 只要名字（解析）不要内容（预览）：dry-run 也必须经过与真发相同的解析与校验。
           let resolved;
           try {
@@ -6715,11 +6820,11 @@ async function main() {
             if (body.dryRun === true) {
               const probe = await inspectAudio(resolved.path, { maxBytes: voice.maxBytes, maxSeconds: voice.maxSeconds });
               if (!probe.ok) { sendJson({ ok: false, error: probe.error }, 400); return; }
-              sendJson({ ok: true, dryRun: true, key, file: resolved.path, detail: describeAudio(probe) });
+              sendJson({ ok: true, dryRun: true, key, file: path.basename(resolved.path), detail: describeAudio(probe) });
               return;
             }
             const sent = await sendVoiceForV2(key, body.voice ?? body.file, {
-              label: body.label ? String(body.label).slice(0, 100) : '',
+              guard, label: body.label ? String(body.label).slice(0, 100) : '',
               verify: body.verify,
               readback: body.readback === true,
               // AI 也可以调音量（默认走 config 的 defaultVolume）
@@ -6741,144 +6846,7 @@ async function main() {
             });
           } catch (error) {
             // 额度只在真正发出后才记账（voiceBudgetCommit），所以失败路径无需回滚。
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
-          }
-          return;
-        }
-
-        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-tts') {
-          const voice = voiceCfg();
-          if (!voice.enabled) { sendJson({ ok: false, error: '语音体系已关闭' }, 403); return; }
-          const body = await readBody();
-          const key = String(body.key ?? '').trim();
-          const text = String(body.text ?? body.message ?? '').trim();
-          const token = String(body.token ?? req.headers['x-agent-token'] ?? '').trim();
-          if (!key || !text) { sendJson({ ok: false, error: 'key 和 text 不能为空' }, 400); return; }
-          if (token && token !== '-' && !agentTokenOk(key, token)) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
-          if (token && token !== '-' && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
-          try {
-            const ttsCfg = cfg.socialV2?.tts ?? {};
-            const reqProvider = String(body.provider ?? ttsCfg.provider ?? 'elevenlabs').toLowerCase();
-            const fallbackProvider = String(ttsCfg.fallbackProvider ?? 'google').toLowerCase();
-            const providersToTry = reqProvider === fallbackProvider ? [reqProvider] : [reqProvider, fallbackProvider];
-            let audioBuf = null;
-            let usedProvider = '';
-            let lastErr = null;
-
-            for (const prov of providersToTry) {
-              try {
-                if (prov === 'elevenlabs') {
-                  const elCfg = ttsCfg.elevenlabs ?? {};
-                  let apiKey = String(elCfg.apiKey || process.env.ELEVENLABS_API_KEY || '').trim();
-                  if (!apiKey && process.platform === 'win32') {
-                    try {
-                      const regOut = execFileSync('reg.exe', ['query', 'HKCU\\Environment', '/v', 'ELEVENLABS_API_KEY'], { encoding: 'utf8', windowsHide: true });
-                      const m = /ELEVENLABS_API_KEY\s+REG_\w+\s+([^\r\n]+)/i.exec(regOut);
-                      if (m?.[1]) {
-                        apiKey = m[1].trim();
-                        process.env.ELEVENLABS_API_KEY = apiKey;
-                      }
-                    } catch {}
-                  }
-                  if (!apiKey) throw new Error('ELEVENLABS_API_KEY 未配置');
-                  const voiceId = String(body.voiceId || elCfg.voiceId || '').trim();
-                  if (!voiceId) throw new Error('未配置 socialV2.tts.elevenlabs.voiceId');
-                  const modelId = String(body.modelId || elCfg.modelId || 'eleven_v3').trim();
-                  const payload = {
-                    text: text.slice(0, 500),
-                    model_id: modelId,
-                    voice_settings: {
-                      stability: Number(elCfg.stability ?? 0.5),
-                      similarity_boost: Number(elCfg.similarityBoost ?? 0.75),
-                      style: Number(elCfg.style ?? 0.35),
-                      use_speaker_boost: true
-                    }
-                  };
-                  if (elCfg.languageCode && !modelId.includes('v3')) {
-                    payload.language_code = String(elCfg.languageCode);
-                  }
-                  let elErr = null;
-                  for (let attempt = 1; attempt <= 2; attempt++) {
-                    try {
-                      const r = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`, {
-                        method: 'POST',
-                        headers: {
-                          'xi-api-key': apiKey,
-                          'Content-Type': 'application/json'
-                        },
-                        body: JSON.stringify(payload),
-                        signal: AbortSignal.timeout(25000)
-                      });
-                      if (!r.ok) {
-                        const errTxt = await r.text().catch(() => '');
-                        throw new Error(`ElevenLabs HTTP ${r.status}: ${errTxt.slice(0, 180)}`);
-                      }
-                      const buf = Buffer.from(await r.arrayBuffer());
-                      if (buf.length < 256) throw new Error('ElevenLabs 返回音频过小');
-                      audioBuf = buf;
-                      usedProvider = `elevenlabs(${voiceId}/${modelId})`;
-                      elErr = null;
-                      break;
-                    } catch (err) {
-                      elErr = err;
-                      if (attempt < 2) await new Promise((res) => setTimeout(res, 600));
-                    }
-                  }
-                  if (elErr) throw elErr;
-                  break;
-                } else if (prov === 'google') {
-                  const gCfg = ttsCfg.google ?? {};
-                  const lang = String(body.lang || gCfg.lang || 'zh-CN').trim();
-                  const gUrl = `https://translate.googleapis.com/translate_tts?ie=UTF-8&client=gtx&tl=${encodeURIComponent(lang)}&q=${encodeURIComponent(text.slice(0, 200))}`;
-                  const r = await fetch(gUrl, {
-                    headers: { 'User-Agent': 'Mozilla/5.0' },
-                    signal: AbortSignal.timeout(12000)
-                  });
-                  if (!r.ok) throw new Error(`Google TTS HTTP ${r.status}`);
-                  audioBuf = Buffer.from(await r.arrayBuffer());
-                  if (audioBuf.length < 256) throw new Error('Google TTS 返回音频过小');
-                  usedProvider = `google(${lang})`;
-                  break;
-                }
-              } catch (e) {
-                log(`[tts] ${prov} 合成失败 (${key}): ${e?.message ?? e}`);
-                lastErr = e;
-              }
-            }
-
-            if (!audioBuf) {
-              throw lastErr || new Error('TTS 合成失败');
-            }
-
-            const ttsDir = voice.dir || path.join(ROOT, 'audio');
-            fs.mkdirSync(ttsDir, { recursive: true });
-            const fileName = `_tts_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp3`;
-            const filePath = path.join(ttsDir, fileName);
-            fs.writeFileSync(filePath, audioBuf);
-
-            try {
-              const sent = await sendVoiceForV2(key, fileName, {
-                label: `[语音] ${text.slice(0, 80)}`,
-                verify: body.verify
-              });
-              log(`[tts] ${key} 已发送 TTS 语音 (${usedProvider}, ${audioBuf.length}B): ${text.slice(0, 60)}`);
-              appendActivity(`${key} [tts] 发送语音 (${usedProvider}): ${text.slice(0, 60)}`);
-              sendJson({
-                ok: true,
-                key,
-                provider: usedProvider,
-                text,
-                messageId: sent.messageId,
-                file: path.basename(sent.file),
-                verified: sent.verification?.confirmed === true
-              });
-            } finally {
-              setTimeout(() => { try { fs.unlinkSync(filePath); } catch {} }, 15000);
-            }
-          } catch (error) {
-            log(`[tts] ${key} 发送失败: ${error?.message ?? error}`);
-            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+            sendJson({ ok: false, error: error?.message ?? String(error) }, error?.statusCode || 500);
           }
           return;
         }
@@ -7153,34 +7121,21 @@ async function main() {
           let actualReplyToMessageId = replyToMessageId;
           if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
             const resolved = await resolveReplyTargetV2(st, kind, id, String(replyToMessageId).trim());
-            if (resolved) {
-              quotedInfo = resolved.info;
-              actualReplyToMessageId = resolved.messageId;
-            }
+            if (!resolved) { sendJson({ ok: false, error: '引用消息不属于当前会话或无法确认' }, 400); return; }
+            quotedInfo = resolved.info;
+            actualReplyToMessageId = resolved.messageId;
           }
           // Creator 专属额度闸门：仅 Creator 私聊，或群聊内明确响应 Creator 指令时放行
           const now = Date.now();
-          let creatorAuthorized = false;
-          if (kind === 'private' && CREATOR_UIDS.has(String(id))) {
-            creatorAuthorized = true;
-          } else if (kind === 'group') {
-            const targetUid = quotedInfo?.userId ? String(quotedInfo.userId) : '';
-            if (targetUid && !CREATOR_UIDS.has(targetUid)) {
-              creatorAuthorized = false;
-            } else if (targetUid && CREATOR_UIDS.has(targetUid)) {
-              creatorAuthorized = true;
-            } else {
-              const recentCreatorMsg = [...(st.recentMessages || [])].reverse().find(
-                (m) => m && !m.isSelf && m.userId && CREATOR_UIDS.has(String(m.userId)) && (now - Number(m.time || 0) <= 180000)
-              );
-              if (recentCreatorMsg) {
-                creatorAuthorized = true;
-                if (!actualReplyToMessageId && recentCreatorMsg.messageId) {
-                  actualReplyToMessageId = String(recentCreatorMsg.messageId);
-                }
-              }
-            }
+          if (body.turn && api.isAgyBackend && !api.isTurnActive(body.turn, state.sessions[key] || null)) {
+            sendJson({ ok: false, error: '生图请求的唤醒回合已过期' }, 409);
+            return;
           }
+          const quoted = st.recentMessages.find((m) => actualReplyToMessageId && String(m.messageId) === String(actualReplyToMessageId));
+          const creatorAuthorized = kind === 'private'
+            ? CREATOR_UIDS.has(String(id))
+            : !!quoted && !quoted.isSelf && now - Number(quoted.time) <= 180000
+              && CREATOR_UIDS.has(quoted.userId) && CREATOR_UIDS.has(quotedInfo?.userId);
           if (!creatorAuthorized) {
             log(`[codex-draw] 拦截非 Creator 外包生图请求 ${key} (quotedUser=${quotedInfo?.userId || 'none'})`);
             sendJson({ ok: false, error: '外包生图（Codex GPT Image 2.5）仅对 Creator 开放' }, 403);
@@ -7201,6 +7156,9 @@ async function main() {
           sendJson({ ok: true, accepted: true, jobId, key, selfRef, asSticker });
 
           // 后台异步调用 Codex CLI (GPT Image 2.5) 生图并自动投递到会话
+          const canDeliver = () => agentTokenOk(key, req.headers['x-agent-token']) && v2SessionAllowed(key)
+            && currentMode === 'reserved2' && cfg.socialV2.enabled !== false && !socialV2.paused && !shouldBlockSilentReply(key)
+            && CREATOR_UIDS.has(kind === 'private' ? id : quotedInfo?.userId);
           void (async () => {
             const tempRefFiles = [];
             try {
@@ -7231,6 +7189,7 @@ async function main() {
                 out: outFile,
                 timeoutSec: 240
               });
+              if (!canDeliver()) return;
               const doneNow = Date.now();
               if (asSticker) {
                 const buf = fs.readFileSync(drawRes.outputFile);
@@ -7290,6 +7249,7 @@ async function main() {
               log(`[codex-draw] 任务失败 ${jobId} (${key}): ${err?.message ?? err}`);
               appendActivity(`${key} [codex-draw] 外包生图失败 (${jobId}): ${String(err?.message ?? err).slice(0, 100)}`);
               try {
+                if (!canDeliver()) return;
                 const sentFail = await sendMessagesV2(key, ['啧，外包那边卡壳没画出来'], [200], actualReplyToMessageId, null);
                 recordSentMessagesV2(key, sentFail);
               } catch {}
@@ -8653,10 +8613,15 @@ async function main() {
           return;
         }
         // ── 重启桥接（守护模式下 5 秒后自动拉起） ──────────────────────────────
-        if (req.method === 'POST' && url.pathname === '/api/restart') {
-          sendJson({ ok: true, message: '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
+        if (req.method === 'POST' && (url.pathname === '/api/restart' || url.pathname === '/api/stop')) {
+          const stop = url.pathname === '/api/stop';
+          if (stop && (await readBody()).pid !== process.pid) {
+            sendJson({ ok: false, error: '桥接实例已变化，请重新检查状态' }, 409);
+            return;
+          }
+          sendJson({ ok: true, message: stop ? '正在停止桥接' : '正在重启桥接（若由守护窗口启动，5 秒后自动恢复）…' });
           setTimeout(() => {
-            log('控制台：重启桥接');
+            log(stop ? '控制台：停止桥接' : '控制台：重启桥接');
             // 退出前落盘：SIGINT/SIGTERM 的收尾路径会 saveState()/saveSocialV2State()，
             // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
             try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
@@ -10692,6 +10657,9 @@ async function main() {
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {
+      if (api.isAgyBackend && wakeSnapshot.messages.length) {
+        agyClaimedSeq.set(wakeState, wakeSnapshot.readThroughSeq);
+      }
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
       noteModelMessagesV2(wakeState, [...wakeSnapshot.messages, ...wakeSnapshot.recent]);
@@ -11267,7 +11235,7 @@ async function main() {
         info: realInfo || {
           sender: String(found.sender || ''),
           text: String(found.text || found.plain || '').slice(0, 200),
-          userId: null,
+          userId: found.userId ?? null,
           messageId: realId,
           seq: found.seq
         },
@@ -11283,7 +11251,7 @@ async function main() {
         info: realInfo || {
           sender: String(found.sender || ''),
           text: String(found.text || found.plain || '').slice(0, 200),
-          userId: null,
+          userId: found.userId ?? null,
           messageId: realId,
           seq: found.seq
         },
@@ -11662,8 +11630,8 @@ async function main() {
     // no longer holds it at all (evicted by unreadLimit, so it can never be displayed
     // again). Scoping the skip to the real buffer range is what keeps this from ever
     // stepping over a still-pending message.
-    const reachable = (seq) => seen.has(seq) || (seq < lowestBuffered && seq <= lastUnread);
-    while (through < lastUnread && reachable(through + 1)) through += 1;
+    through = Math.max(through, Math.min(lastUnread, lowestBuffered - 1));
+    while (through < lastUnread && seen.has(through + 1)) through += 1;
     return through;
   }
 
@@ -11784,9 +11752,11 @@ async function main() {
     return `${lines.join('\n')}\n\n`;
   }
 
-  const agyClaimedSeq = new Map();
+  const agyClaimedSeq = new WeakMap();
   function getAgyClaimedSeq(key, st) {
-    return Math.max(agyClaimedSeq.get(key) || 0, Number(st?.lastReadThroughSeq) || 0);
+    const sid = state.sessions[key];
+    if (!sid || api.activeTurnCount(sid) === 0) agyClaimedSeq.delete(st);
+    return Math.max(agyClaimedSeq.get(st) || 0, Number(st.lastReadThroughSeq) || 0);
   }
 
   const agyTurnDefaultReply = new Map();
@@ -11833,7 +11803,7 @@ async function main() {
   function checkAndClaimTurnActionV2(key, turnRaw, actionSig) {
     const turn = String(turnRaw ?? '').trim();
     if (!turn) return null;
-    if (api?.isTurnCompleted?.(turn)) {
+    if (api.isAgyBackend && !api.isTurnActive(turn, state.sessions[key] || null)) {
       return `唤醒回合 ${turn} 已完结，拦截重复重放`;
     }
     const now = Date.now();
@@ -11999,9 +11969,7 @@ async function main() {
       for (const msg of unreadSource.slice(0, maxUnread)) if (!tryAdd('messages', msg)) break;
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
-      const excludeSeqs = claimSlice
-        ? includedSeqs
-        : new Set(st.unread.map((m) => m.seq));
+      const excludeSeqs = new Set(unreadSource.map((m) => m.seq));
       const recent = st.recentMessages.filter((m) => !Number.isSafeInteger(m.seq) || !excludeSeqs.has(m.seq)).slice(-maxRecent);
       for (const msg of recent.reverse()) if (!tryAdd('recent', msg)) break;
       packet.recent.reverse();
@@ -12010,7 +11978,6 @@ async function main() {
     const nextClaimed = Math.max(packet.readThroughSeq || 0, maxIncludedSeq);
     if (claimSlice && packet.messages.length > 0 && nextClaimed > prevClaimed) {
       packet.readThroughSeq = Math.max(packet.readThroughSeq, nextClaimed);
-      agyClaimedSeq.set(key, nextClaimed);
     }
     return packet;
   }
@@ -12073,16 +12040,18 @@ async function main() {
     if (roleState.role) {
       try {
         const rf = roleFilePath(roleState.role);
-        const mtime = Math.floor(fs.statSync(rf).mtimeMs);
-        const sig = `${roleState.role}:${mtime}`;
+        const stat = fs.statSync(rf);
+        const sig = [roleState.role, stat.mtimeMs, stat.size, roleInjectMaxChars].join(':');
         if (agyLastRoleSig.get(slotKey) !== sig) {
-          const cardText = readRoleContent(roleState.role).trim();
+          const cardText = currentRoleHintV2();
           agyLastRoleSig.set(slotKey, sig);
           if (cardText) {
             prefix += `【角色卡已热更新：${roleState.role}（请立即以此最新人设为准，覆盖旧习惯）】\n${cardText}\n\n`;
           }
         }
       } catch {}
+    } else if (agyLastRoleSig.delete(slotKey)) {
+      prefix += '【角色卡已清除】从本轮起使用默认身份。\n\n';
     }
     const comp = MEMORY_COMPARTMENTS[key];
     if (comp && fs.existsSync(comp.summaryPath)) {
@@ -12125,14 +12094,13 @@ async function main() {
 
     // AGY 极简唤醒头：剔除每轮重复的 ~2000 字 DSH 时代八股、令牌、陈年搁置话题与长篇规则（已在首轮角色卡与 agent.md 中常驻），单轮上下文增长降低 >70%
     if (isCompactWake) {
-      const hasCreatorDrawReq = (String(key ?? '').startsWith('private:')
-        || (Array.isArray(st.unread) && st.unread.some((m) => m && !m.isSelf && CREATOR_UIDS.has(String(m.userId ?? '')))))
-        && (Array.isArray(st.unread) && st.unread.some((m) => /[画图绘改像表情]/.test(String(m?.plain || m?.text || ''))));
+      const hasCreatorDrawReq = st.unread.some((m) => !m.isSelf && CREATOR_UIDS.has(m.userId)
+        && /[画图绘改像表情]/.test(String(m.plain || m.text || '')));
       const hasVoiceReq = Array.isArray(st.unread) && st.unread.some((m) => /(?:语音|说话|开口|声音|叫一[声下]|听.*声|发条语音|念一[下遍]|tts)/i.test(String(m?.plain || m?.text || '')));
       const drawHint = hasCreatorDrawReq
         ? '\n【外包画图提示】Creator 若让画图/改图，同命令加 --codex-draw "{\\"prompt\\":\\"详细描述\\",\\"selfRef\\":true}"（严禁用内置 generate_image）。'
         : '';
-      const voiceHint = hasVoiceReq
+      const voiceHint = hasVoiceReq && voiceCfg().enabled && v2ToolEnabled('sendVoice') && ttsEnabled()
         ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "要亲口说的短句台词" 发送真实 QQ 语音条（可单发 --tts 不带文字，或配文字一起发）！'
         : '';
       if (reason === 'replyCheck') {

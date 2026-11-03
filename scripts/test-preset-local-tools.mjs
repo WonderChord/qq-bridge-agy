@@ -102,10 +102,7 @@ const OPTIONAL_BUNDLE_TOOLS = new Set(['subagent_codex', 'subagent_claude_code']
  * 误判方向很危险——它会逼人把真名字从守卫名单里删掉，等于自己拆掉安全边界。
  * 现在只保留一条实现，两边不可能再漂移。
  */
-function collectDshToolNames() {
-  const { names } = collectDshToolNamesShared();
-  return names.size === 0 ? null : new Set(names.keys());
-}
+const PLUGIN_GUARD_TOOLS = new Set(['dsh_snapshot', 'dsh_rollback', 'incident_resolved']);
 /** 允许出现在名单里、但不属于"本地执行"语义的名字（开发/注入器）。 */
 const DEV_TOOL_PREFIX = /^dev_/;
 
@@ -206,20 +203,27 @@ test('守卫导出的名单与本测试的清单一致（防两份名单各自�
   }
 });
 
-test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错假名静默失效）', async () => {
+test('守卫名单里的每个名字都是 DSH 真实注册的工具（防拼错假名静默失效）', async (t) => {
   // 为什么必须测：`tools.restrict()` 对未知名字会**抛错**，而守卫逐个 try/catch
   // 只打日志 ⇒ 拼错的名字 = **静默 no-op**。这正是本名单初版的真实缺陷：
   // pwsh_persistent / bash_persistent / cordis / goal_write / goal_read 五个假名
   // 让整批限制悄悄少生效，而套件当时全绿。
-  const dshNames = collectDshToolNames();
-  if (dshNames === null) {
-    console.log('  ⏭  跳过：未找到 DSH 工具包（设 DSH_TOOL_PACKAGES 指向 @deepseek-ai 目录即可启用）');
-    return;
+  let registry;
+  try {
+    registry = collectDshToolNamesShared();
+  } catch (error) {
+    if (error.code !== 'DSH_MODULES_NOT_FOUND' || process.env.DSH_HOME) throw error;
+    return t.skip('本机未安装 DSH。设置 DSH_INSTALL_MODULES 后可与真实工具名对账');
   }
+  const dshNames = registry.names;
+  assert.ok(dshNames.size, '指定的 DSH 安装目录中未发现已注册工具');
+  const hasPluginGuard = registry.packages.some((p) => p === 'dsh-plugin-guard' || p === 'plugin-guard')
+    || [...PLUGIN_GUARD_TOOLS].some((name) => dshNames.has(name));
   for (const id of SIMULATION_PRESETS) {
     const { dir } = readPreset(id);
     const mod = await import(pathToFileURL(path.join(dir, 'qq-tool-restrict.mjs')).href);
     const fabricated = mod.RESTRICTED_TOOL_NAMES
+      .filter((n) => hasPluginGuard || !PLUGIN_GUARD_TOOLS.has(n))
       .filter((n) => !DEV_TOOL_PREFIX.test(n) && !OPTIONAL_BUNDLE_TOOLS.has(n) && !dshNames.has(n));
     assert.deepEqual(fabricated, [],
       `${id}: 以下名字在 DSH 已安装的工具包里找不到 ⇒ restrict 会抛错并被吞掉，`

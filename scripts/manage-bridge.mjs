@@ -2,48 +2,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { ROOT, loadConfig, readConsoleToken } from './bridge-local.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
 const LOCK_FILE = path.join(ROOT, 'state', 'bridge.lock');
 
-function loadConfig() {
-  try {
-    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-function readConsoleToken() {
-  try {
-    const c = loadConfig();
-    const configured = String(c.consoleToken ?? '').trim();
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;
-  } catch {}
-  try {
-    return fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
-
 async function queryStatus() {
-  const port = Number(loadConfig().consolePort) || 3100;
-  const token = readConsoleToken();
+  const config = loadConfig();
+  const port = Number(config.consolePort) || 3100;
+  let res;
   try {
-    const res = await fetch(`http://127.0.0.1:${port}/api/agy/status`, {
-      headers: token ? { 'x-console-token': token } : {},
-      signal: AbortSignal.timeout(2500),
+    res = await fetch('http://127.0.0.1:' + port + '/api/status', {
+      headers: { 'x-console-token': readConsoleToken(config) }, signal: AbortSignal.timeout(2500),
     });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
+  } catch (error) {
+    if (error.cause?.code === 'ECONNREFUSED') return null;
+    throw error;
   }
+  if (!res.ok) throw new Error('控制台状态查询失败，HTTP ' + res.status);
+  const { pid, backend, dshReady, mode, workers } = await res.json();
+  return { pid, backend, dshReady, mode, workers };
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -56,13 +33,22 @@ async function main() {
     return;
   }
   if (action === 'stop') {
-    try {
-      const pid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim());
-      if (pid > 0) process.kill(pid);
-    } catch {}
-    try { fs.unlinkSync(LOCK_FILE); } catch {}
-    console.log('已停止 qq-bridge');
-    return;
+    const st = await queryStatus();
+    if (!st) { console.log('qq-bridge 未运行'); return; }
+    const pid = Number(fs.readFileSync(LOCK_FILE, 'utf8').trim());
+    if (!Number.isSafeInteger(pid) || st.pid !== pid) throw new Error('控制台实例与本目录的锁文件不匹配');
+    const cfg = loadConfig();
+    const res = await fetch('http://127.0.0.1:' + (Number(cfg.consolePort) || 3100) + '/api/stop', {
+      method: 'POST', headers: { 'x-console-token': readConsoleToken(cfg), 'content-type': 'application/json' },
+      body: JSON.stringify({ pid }), signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) throw new Error('请求停止失败，HTTP ' + res.status);
+    for (let i = 0; i < 25; i++) {
+      await sleep(200);
+      const current = await queryStatus();
+      if (!current || current.pid !== pid) { console.log('已停止 qq-bridge'); return; }
+    }
+    throw new Error('停止请求已接受，等待实例退出超时');
   }
   if (action === 'start') {
     const existing = await queryStatus();
@@ -88,6 +74,7 @@ async function main() {
     console.error('qq-bridge 启动超时，请检查 state/bridge.log');
     process.exit(1);
   }
+  throw new Error('用法：node scripts/manage-bridge.mjs start|stop|status');
 }
 
-main();
+main().catch((error) => { console.error(error.message); process.exitCode = 1; });

@@ -8,37 +8,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { napcatLoginConfig } from '../src/napcat-config.js';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const AUTH_PATH = path.resolve(__dirname, '../state/napcat-auth.json');
-// NapCat WebUI 配置：config.json → napcat.webuiConfigPath
-const WEBUI_CONFIG_PATH = (() => {
-  try {
-    let text = fs.readFileSync(path.resolve(__dirname, '../config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return String(JSON.parse(text)?.napcat?.webuiConfigPath || '');
-  } catch {
-    return '';
-  }
-})();
+const root = fileURLToPath(new URL('../', import.meta.url));
 
 function loadAuthConfig() {
-  const auth = JSON.parse(fs.readFileSync(AUTH_PATH, 'utf8'));
-  try {
-    if (fs.existsSync(WEBUI_CONFIG_PATH)) {
-      const webui = JSON.parse(fs.readFileSync(WEBUI_CONFIG_PATH, 'utf8'));
-      if (webui.token) auth.webuiToken = webui.token;
-      if (webui.port) auth.webuiUrl = `http://${webui.host || '127.0.0.1'}:${webui.port}`;
-    }
-  } catch {}
-  return auth;
+  const file = path.join(root, 'config.json');
+  const cfg = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, '')) : {};
+  return napcatLoginConfig(root, cfg.napcat);
 }
 
 async function getCredential(webuiUrl, token) {
   const hash = crypto.createHash('sha256').update(`${token}.napcat`).digest('hex');
   const res = await fetch(`${webuiUrl}/api/auth/login`, {
-    method: 'POST',
+    method: 'POST', redirect: 'error',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ hash }),
     signal: AbortSignal.timeout(8000),
@@ -52,7 +36,7 @@ async function getCredential(webuiUrl, token) {
 
 async function napcatPost(webuiUrl, cred, endpoint, body = {}) {
   const res = await fetch(`${webuiUrl}${endpoint}`, {
-    method: 'POST',
+    method: 'POST', redirect: 'error',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${cred}`,
@@ -107,7 +91,7 @@ export async function checkAndReloginNapCat({ force = false, logger = console.lo
   return { ok: false, action: 'need_qrcode', qrcodeUrl, webuiUrl };
 }
 
-if (import.meta.url === `file://${process.argv[1].replace(/\\/g, '/')}` || process.argv[1]?.endsWith('napcat-auto-relogin.mjs')) {
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   const force = process.argv.includes('--force');
   checkAndReloginNapCat({ force })
     .then((r) => {

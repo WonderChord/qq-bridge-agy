@@ -1,20 +1,12 @@
-# QQ ↔ DeepSeek Harness Bridge (qq-bridge)
+# QQ ↔ Antigravity / DeepSeek Harness Bridge
 
-> Connect QQ messages to DeepSeek Harness (DSH) or Google Antigravity (AGY) agents: QQ friends/groups become agent conversations, and replies (text, stickers, TTS voice bubbles, images) are sent back to QQ.
->
-> 🤖 **Pure Vibe Coding Disclaimer**: The Antigravity backend, headless NapCat self-healing daemon, 3-subagent low-token architecture, dual-provider TTS, and Codex image generation additions in this branch were **built entirely via AI-assisted Vibe Coding**. Provided "AS IS" under the MIT License for personal learning and technical experimentation only, without warranty of any kind (including code quality, token billing, or QQ account risk).
+Bridge QQ chats to Antigravity or DeepSeek Harness through a local OneBot v11 gateway. Configure an allowlist for the groups and friends that should receive replies.
 
-> ⚠️ **Current release `v0.2.1-r1`, targets DSH 0.2.1-rc.2** (also compatible with 0.2.0-rc.2; verified item by item on both — run `npm run verify:adaptation`). It uses the persistent local signing key to **mint the session Cookie offline**, slash RPC endpoints and the `/api/remote.mux` event stream — a protocol generation introduced in DSH `0.1.2-alpha.1`, incompatible with the older dot-endpoint protocol. Reading the launch token out of the old guard logs has not worked since DSH 0.1.7 (the token is generated per process and never written to disk). Agent presets are `@deepseek-ai/dsh-agent-preset` Cordis rows since DSH 0.1.7 (the `~/.dsh/.agent-presets/` directory mechanism is gone). On **DSH `0.1.1-rc.2` or earlier**, use tag [`v0.1.0`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.0); for **DSH 0.1.5-rc.1** use [`v0.1.5`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.5); for **DSH 0.1.7-rc.2** use [`v0.1.7`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.7).
->
-> **r4 highlights**: sticker/animated-emoji pipeline (CDN first, `emoji_id` fallback, multi-address DNS failover), web search now reuses DSH's own DeepSeek search backend (Bing only as fallback), `qq_wait_for_messages` long-polling past the 300 s undici timeout, plus fixes for the mode-switch rollback, permanent "busy" turns, missing self-identity injection and a full-project audit. Details: [Release v0.2.0-r4](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.2.0-r4).
->
-> **v0.2.1-r1 highlights**: DSH 0.2.1-rc.2 adaptation. Fixes a **P0** — the `{{cwd}}` prompt variable used by both QQ presets was removed in DSH 0.2.1, so *every* turn failed during system-prompt assembly before the model ran (QQ showed it as "no reply at all"). Also adds the newly global `working_directory` tool plus the terminal / session-query / plugin-market families to the safety guard. Details: [docs/guides/DSH_021_ADAPTATION.md](docs/guides/DSH_021_ADAPTATION.md).
->
-> The default branch `main` **is** this version — a plain `git clone` gets it, no branch switching needed.
+Use Node.js 22.13 or newer. Run `npm ci` and `npm test`, then copy `config.example.json` to `config.json`. For Antigravity, set `dsh.baseUrl` to `agy://local`, install the bundled plugin and start its workers. For DSH, keep the local HTTP address and install the QQ presets. Start the bridge with `npm start`. The local console shows the selected backend and, for Antigravity, waiting workers, busy workers and queued wakes.
 
-For the detailed Chinese guide, see **[docs/guides/PROJECT_GUIDE.md](docs/guides/PROJECT_GUIDE.md)**.
-The documentation index (one line per doc, with "still current?" notes) is **[docs/README.md](docs/README.md)**;
-the repository/folder and script-naming conventions are in **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**.
+[中文](README.md) · [Antigravity setup](docs/guides/ANTIGRAVITY.md) · [DSH setup](docs/guides/DSH_SETUP.md) · [Documentation index](docs/README.md)
+
+Based on Derpyu520/qq-bridge v0.2.1-r1. The Antigravity extensions were developed with AI assistance and are distributed under the [MIT license](LICENSE).
 
 ## Architecture
 
@@ -25,14 +17,14 @@ QQ messages ──► SnowLuma / NapCat (OneBot v11 WS) ──► qq-bridge ─�
                                                           └── replies / stickers / TTS / images ┘
 ```
 
-## Antigravity (AGY) + Headless NapCat Mode (New in v0.3.0)
+## Antigravity (AGY) + Headless NapCat Mode
 
 In addition to DeepSeek Harness (DSH), `qq-bridge` now natively supports **Google Antigravity (AGY)** via zero-polling long-poll wakeups (`dsh.baseUrl = "agy://local"`) and **Headless NapCat** daemon management under the same MIT license:
 
 - **Ultra-Low-Token 3-Subagent Architecture (`agy-plugin/`)**:
-  1. **`qq-chat-worker` (`w1`)**: Single-worker KV-cache-warmed chat loop with 72%-slimmed wake headers and 2s message batching. Uses `scripts/agy-reply-and-wait.mjs` to send text/batch replies, stickers (`--sticker`), native QQ voice bubbles (`--tts`), or Codex drawings (`--codex-draw`) and mark messages read in **one command**, rotating cleanly every **25 turns**.
+  1. **`qq-chat-worker` (`w1`)**: Single-worker KV-cache-warmed chat loop with compact wake headers and batched messages. Uses `scripts/agy-reply-and-wait.mjs` to send text/batch replies, stickers (`--sticker`), native QQ voice bubbles (`--tts`), or Codex drawings (`--codex-draw`) and mark messages read in **one command**, rotating cleanly every **25 turns**.
   2. **`qq-flash-judge` (`flash`)**: Zero-token pre-filter strips single-char/image-only noise before passing ambiguous nickname hits (`persona.ambiguousKeywords`) and `0.12` diving samples (with 14-message context) to Flash for instant `yes/no` gating; rotates every **30 turns**.
-  3. **`qq-memory-archivist` (`flash`)**: Asynchronous compartmented long-term memory archiver configured via `persona.memoryCompartments` (e.g. every 150 group messages / 40 private messages), strictly isolated per session.
+  3. **`qq-memory-archivist` (`flash`)**: Asynchronous compartmented long-term memory archiver configured via `persona.memoryCompartments` (e.g. every 150 group messages / 40 private messages), stored in the configured directories.
 - **Zero-Deployment Dual-Provider TTS (`/api/socialV2/send-tts` & `--tts`)**:
   - Supports **ElevenLabs** (`ELEVENLABS_API_KEY` env var, `eleven_v3`) as primary and **Google TTS** (keyless GTX endpoint) as automatic fallback, encoding native QQ SILK voice bubbles via `ffmpeg` + OneBot `record`.
 - **Headless NapCat Kernel Probe & Self-Healing (`scripts/ensure-daemons.ps1`)**:
@@ -67,7 +59,7 @@ See **[docs/guides/ANTIGRAVITY.md](docs/guides/ANTIGRAVITY.md)** for full setup 
 ## Quick Start
 
 ```bash
-npm install        # postinstall automatically patches the @snowluma/sdk ESM packaging bug
+npm ci             # postinstall automatically patches the @snowluma/sdk ESM packaging bug
 ```
 
 Copy `config.example.json` to `config.json`, then edit:
@@ -154,7 +146,7 @@ lives in the sibling folder **`../voice-tool/`** — it only needs SnowLuma, and
 
 ## Testing
 
-`npm run test:audit` runs isolated regression tests without production credentials, DSH, or QQ messages. The detailed audit is in [docs/audits/AUDIT_REPORT_2026-09-20.md](docs/audits/AUDIT_REPORT_2026-09-20.md) (Chinese); the 2026-09-18 one it superseded is archived in [docs/legacy/](docs/legacy/).
+Run `npm test` for the isolated bridge regression suite. Real QQ delivery and live DSH adaptation checks are separate.
 
 After upgrading, legacy QQ session mappings without permission metadata are recreated once. Mode or preset changes also retire the old mapping and recreate the session on the next message; DSH history is retained.
 

@@ -148,7 +148,7 @@ export function buildPatches({ check = false, log = () => {} } = {}) {
     const file = patchFileFor(name);
     const content = renderPatch(name);
     const current = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-    const changed = current !== content;
+    const changed = current?.replace(/\r\n/g, '\n') !== content;
     if (changed && !check) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       fs.writeFileSync(file, content, 'utf8');

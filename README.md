@@ -1,77 +1,31 @@
-# QQ ↔ DeepSeek Harness 桥接
+# QQ ↔ Antigravity / DeepSeek Harness 桥接
 
-**English**: [README.en.md](README.en.md) | **中文**: [README.md](README.md)
+将 QQ 私聊和群聊接到本机的聊天后端。OneBot 接收消息并发送回复，桥接负责白名单、会话、唤醒和本地控制台。选择一条运行路径即可。
 
-> 🗂️ 文档索引（全部文档一句话说明 + 是否仍然有效）见 **[docs/README.md](docs/README.md)**；仓库目录/脚本命名约定见 **[docs/FOLDER_MAP.md](docs/FOLDER_MAP.md)**。
->
-> 🔒 QQ 会话的权限边界与安全承诺见 **[RULES.md](RULES.md)**。
->
-> 🎤 独立的「发语音」工具已拆到仓库上一级的 **`../voice-tool/`**（命令行 `voice-cli.mjs` / 图形界面 `voice-gui.mjs`），不再依赖 qq-bridge 运行。
->
-> 🛰️ **本分支新增 Antigravity 后端**：`dsh.baseUrl = "agy://local"` 后由 Antigravity 子代理接管聊天（单 Worker + Flash 预筛 + Flash 记忆归纳），并支持无头 NapCat 守护、ElevenLabs / Google TTS 语音条、Codex 外包画图与按会话分舱的长期记忆。配置与插件安装见 **[docs/guides/ANTIGRAVITY.md](docs/guides/ANTIGRAVITY.md)**。
->
-> 🤖 **纯 Vibe Coding 免责声明**：本分支新增的 Antigravity 后端、无头 NapCat 自愈守护、三子代理省流架构、TTS 语音条与外包生图等改造**全程由 AI 辅助（纯 Vibe Coding）生成与迭代**，按原样（"AS IS"）基于 MIT 协议开源分享，仅供个人学习、整活与技术交流。作者不对代码质量、稳定性、Token 账单消耗、第三方接口变动或 QQ 账号风控承担任何担保或连带责任，使用前请自行审阅配置并自担风险。
+| 聊天后端 | 如何启用 | 如何确认已就绪 |
+| --- | --- | --- |
+| Antigravity | 将 `dsh.baseUrl` 设为 `agy://local`，安装仓库内的插件，启动值守 Worker | 控制台显示 Antigravity，待命或处理中的 Worker 至少有一个。[配置指南](docs/guides/ANTIGRAVITY.md) |
+| DeepSeek Harness | 使用示例中的本机 DSH 地址，安装 QQ preset 和 MCP | 控制台显示 DSH 已连接，QQ 会话使用所选模式的 preset。[安装指南](docs/guides/DSH_SETUP.md) |
 
-把 QQ 消息接入 DSH agent：QQ 好友/群发来的消息会变成 DSH 会话里的用户消息，agent 的回复（含提问、工具审批）会发回 QQ。
+## 从源码开始
 
-> ⚠️ **当前版本 `v0.2.1-r1`，适配 DSH 0.2.1-rc.2**（0.2.0-rc.2 亦兼容；两个版本上都逐项实测：`npm run verify:adaptation`）。
-> 鉴权用 `~/.dsh` 里持久化的浏览器会话签名密钥**离线铸造 Cookie** —— DSH 0.1.7 起进程启动 token
-> 只存在于内存、不再落盘，旧版「从 guard 日志里读 token」的方式已失效。agent preset 是 DSH 0.1.7 起的
-> `@deepseek-ai/dsh-agent-preset` Cordis 行（`~/.dsh/.agent-presets/` 目录机制已废）。协议代次
-> （Cookie 鉴权 / 斜杠 RPC / `/api/remote.mux` 事件流）自 DSH `0.1.2-alpha.1` 起引入，与更早的点号
-> endpoint 协议不兼容 —— **DSH `0.1.1-rc.2` 及更早**请改用 tag
-> [`v0.1.0`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.0)；**DSH 0.1.5-rc.1** 用
-> [`v0.1.5`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.5)；**DSH 0.1.7-rc.2** 用
-> [`v0.1.7`](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.1.7)。
->
-> v0.2.0 修的主要是**会话待处理队列读不出来**：桥接退役/重置 QQ 会话时要先清掉 DSH 侧没跑的队列，
-> 而那段解析认的是一个**从来不存在的字段**（`session/control` baseline 的 `value.queues[<id>]`）——
-> 于是**每一次**退役都抛 `invalid session/control baseline`，队列清不掉、旧任务继续在 DSH 里跑，
-> 而日志里只有一行警告。**注意：这不是 0.2.0 引入的**——该代码随 v0.1.7 发布，报错日志早于
-> 0.2.0-rc.2 的发布，0.2.0 只是把它翻了出来。现在读队列以一元 RPC `session/projections` 为主路径、
-> 以 `projections[<id>].values.inbox` 为回退形状，并补了两条回归网。
-> 同一轮还按 0.2.0 的真实工具清单重新对账了 QQ 安全守卫（新增 15 个必须隐藏的工具名，
-> 含全局层默认启用的 `read_mcp_resource`、`plugin_manager`、`subagent_codex` 等）。
->
-> 逐条改动说明见 [docs/guides/DSH_020_ADAPTATION.md](docs/guides/DSH_020_ADAPTATION.md)（0.2.0）
-> 与 [docs/guides/DSH_021_ADAPTATION.md](docs/guides/DSH_021_ADAPTATION.md)（0.2.1）。
->
-> **r4 主要改动**：QQ 表情包/动图链路（表情 CDN 优先、`emoji_id` 兜底、DNS 多地址故障切换）、
-> 联网搜索改用与 DSH 同源的 DeepSeek 搜索（Bing 仅兜底）、`qq_wait_for_messages` 改 5 分钟长轮询、
-> 控制台切模式被 5 秒轮询改回去、回合永久「繁忙」、机器人身份未注入等 issue 修复，外加一轮整体体检。
-> 逐条见 [**Release v0.2.0-r4**](https://github.com/Derpyu520/qq-bridge/releases/tag/v0.2.0-r4)。
->
-> **v0.2.1-r1 主要改动**：适配 DSH 0.2.1-rc.2。修掉一处 **P0**——persona 里的 `{{cwd}}`
-> 提示词变量在 0.2.1 被删除，导致**每个回合在系统提示词装配阶段直接 error、模型一次都不跑**
-> （QQ 侧表现为「发消息完全没反应」）；同时把 0.2.1 新进全局层的 `working_directory`
-> 与 terminal / session-query / plugin_market 一族补进安全守卫名单。
-> 逐条见 [docs/guides/DSH_021_ADAPTATION.md](docs/guides/DSH_021_ADAPTATION.md)。
->
-> 默认分支 `main` **就是**本版本，`git clone` 直接拿到，无需切换分支。
+安装 Node.js 22.13 或更高版本，在 PowerShell 中运行下列命令。首次安装时将示例配置复制为本机配置。
 
-```
-QQ 消息 ──► SnowLuma / NapCat（OneBot v11 WS）──► 本桥接进程 ──► DSH Web API (127.0.0.1:3080/api)
-                                                        │   └──► 或 Antigravity (dsh.baseUrl = "agy://local")
-                                                        ▲                      │
-                                                        └── agent 回复/表情/语音/生图 ┘
+```powershell
+git clone https://github.com/WonderChord/qq-bridge-agy.git
+cd qq-bridge-agy
+npm ci
+npm test
+Copy-Item config.example.json config.json
 ```
 
-## Antigravity (AGY) + 无头 NapCat 全自动值守模式（v0.3.0 新增）
+在 `config.json` 填写 OneBot 的 WebSocket 与 HTTP 地址、令牌、`ownerQQ` 和需要响应的 `allow.private` 或 `allow.groups`。完成对应后端的设置后运行 `npm start`。控制台默认位于 `http://127.0.0.1:3100`，首次登录使用 `state/console-token` 里的令牌，手动配置了 `consoleToken` 时使用配置值。
 
-除原有的 DeepSeek Harness（DSH）后端外，本仓库现原生支持 **Google Antigravity (AGY)** 零轮询阻塞唤醒后端与 **无头 NapCat** 守护模式（同为 MIT 开源，所有角色设定、触发词与分舱记忆均已抽离为 `config.json` 配置项）：
+AGY 支持长期记忆分舱、表情、TTS 语音条、创作者生图和无头 NapCat 守护。DSH 路径沿用上游 v0.2.1-r1 的 preset 和协议适配，版本细节见 [DSH 0.2.1 适配记录](docs/guides/DSH_021_ADAPTATION.md)。
 
-- **超省流三子代理架构（`agy-plugin/` 一键安装）**：
-  1. **`qq-chat-worker`（`w1` 聊天主线程）**：单线程承接全部唤醒以保持 5 分钟 KV Cache 持续命中（网桥内置 2s 合批与 72% 极简唤醒头压缩），通过 `scripts/agy-reply-and-wait.mjs` **单条命令**同时完成「发文字 / 批量引用回多人 / 发表情包 / 发 TTS 语音条 / 触发 Codex 画图 / 偷表情包 / 标已读并挂起等下一轮」，满 **25 轮**自动无状态换新。
-  2. **`qq-flash-judge`（Flash 前置预筛线程）**：网桥先在零 Token 层滤除纯图/单字/纯表情废话，仅对模糊称呼（`persona.ambiguousKeywords`）与潜水 `0.12` 概率抽样拉取最近 14 条上下文交由 Flash 极速二分类（`yes/no`），满 **30 轮**自动换新。
-  3. **`qq-memory-archivist`（Flash 旁路分舱记忆归纳线程）**：按 `persona.memoryCompartments` 物理隔离各群聊与私聊记忆，群聊每满 150 条 / 私聊每满 40 条异步归纳至 `<dir>/summary.md` 与 `<dir>/diary/`，严禁跨群串台。
-- **双通道免部署 TTS 语音条（`/api/socialV2/send-tts` & `--tts`）**：
-  - 主通道支持 **ElevenLabs**（读取环境变量 `ELEVENLABS_API_KEY`，支持 `eleven_v3` 等多语种模型），兜底/免配置通道支持 **Google TTS**（`translate.googleapis.com` GTX 接口，免 Key 直出），合成后经 `ffmpeg` 与 OneBot `record` 段直发原生 QQ 手机端可点播的 SILK 语音气泡。
-- **Codex CLI (GPT Image 2.5) 外包生图/自画像（`/api/socialV2/codex-draw` & `--codex-draw`）**：
-  - 复用本机已登录 ChatGPT 会员的 Codex CLI 异步生图（仅对 `persona.creatorUids` 开放），画机器人自画像时自动挂载 `persona.selfRefs` 参考图与 `persona.appearanceAnchor` 外观锚点，后台生图完成后自动引用发送。
-- **无头 NapCat 内核假死探测与无窗自愈（`scripts/ensure-daemons.ps1`）**：
-  - 针对 NTQQ MSF 断流假死时 `/get_status` 仍虚报 `online: true` 的问题，内置 `get_stranger_info(no_cache: true)` 实时内核探针；超时自动通过 WMI `ShowWindow=0` 零弹窗重启无头 NapCat 并调用 `napcat-auto-relogin.mjs` 走 `SetQuickLogin` 免密重连（永久移除明文密码登录回退，避免触发滑块风控）。
+[English](README.en.md) · [文档索引](docs/README.md) · [QQ 权限规则](RULES.md) · [语音与可选独立工具](docs/guides/QQ_VOICE.md)
 
-> 📖 Antigravity 后端的完整配置、插件安装与启动流程见 **[docs/guides/ANTIGRAVITY.md](docs/guides/ANTIGRAVITY.md)**。
+本项目基于 Derpyu520/qq-bridge，Antigravity 扩展由 AI 辅助开发，按 [MIT 许可](LICENSE) 提供。
 
 ## 项目展示
 
@@ -120,14 +74,14 @@ QQ 消息 ──► SnowLuma / NapCat（OneBot v11 WS）──► 本桥接进�
 
 ## 前置条件
 
-1. 运行中的 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）
-2. 运行中的 SnowLuma，且配置好 OneBot WebSocket 与 HTTP API（默认 `ws://127.0.0.1:3001` / `http://127.0.0.1:3000`，`accessToken` 视配置填写）
+1. 运行中的 Antigravity，或 DeepSeek Harness Web（默认 `http://127.0.0.1:3080`）
+2. 运行中的 NapCat 或 SnowLuma，且配置好 OneBot WebSocket 与 HTTP API（默认 `ws://127.0.0.1:3001` / `http://127.0.0.1:3000`，`accessToken` 视配置填写）
 3. Node.js ≥ 22.13
 
 ## 安装与配置
 
 ```bash
-npm install        # 安装依赖（postinstall 会自动修补 @snowluma/sdk 的 ESM 打包 bug）
+npm ci             # 安装依赖（postinstall 会自动修补 @snowluma/sdk 的 ESM 打包 bug）
 ```
 
 复制 `config.example.json` 为 `config.json` 后编辑：
@@ -181,7 +135,7 @@ node scripts/setup-dsh.mjs
 
 详细步骤见 **[docs/guides/DSH_SETUP.md](docs/guides/DSH_SETUP.md)**。
 
-## 完整启动流程（从零开始）
+## DeepSeek Harness 完整启动流程
 
 共 6 步。DSH 已安装并运行，缺的是 SnowLuma 本体 + 桥接侧的 DSH 端安装（**第 2、3 步最容易漏，漏了 QQ 上会毫无反应**）：
 
@@ -190,9 +144,9 @@ node scripts/setup-dsh.mjs
 
 2. **装桥接并复制配置**
    ```bash
-   git clone https://github.com/Derpyu520/qq-bridge.git
-   cd qq-bridge
-   npm install
+   git clone https://github.com/WonderChord/qq-bridge-agy.git
+   cd qq-bridge-agy
+   npm ci
    ```
    Windows CMD 用 `copy config.example.json config.json`，其他平台用 `cp config.example.json config.json`。
    **示例模板里 `allow.private` / `allow.groups` 是空数组**——空白名单 + `allowAllWhenEmpty: false` 时桥接不响应任何消息（这是刻意的 fail-closed 默认值）。白名单在第 5 步填。
@@ -307,7 +261,7 @@ qq-bridge/
   state/                # 运行时数据（不入库）
 ```
 
-> 🎤 **独立的「发语音」工具不在这里**：它是仓库上一级的 [`../voice-tool/`](../voice-tool/)（`voice-cli.mjs` /
+> 🎤 **独立的「发语音」工具不在这里**：它是仓库上一级的 [`../voice-tool/`](docs/guides/QQ_VOICE.md)（`voice-cli.mjs` /
 > `voice-gui.mjs` / `public/voice.html` / `发语音.cmd`）。图形界面双击上一级的「发语音-图形界面.cmd」。
 > 它只依赖 SnowLuma，共享内核仍由本仓库 `src/voice-core.js` / `src/snowluma-conn.js` 提供（单一实现）。
 >

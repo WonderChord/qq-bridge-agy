@@ -32,5 +32,5 @@ description: 运行和值守基于无头 NapCat + qq-bridge 的全自动 QQ 机�
 
 ## 三、排障
 
-- 私聊/群聊回复 `403 agent token 无效`：`/api/agy/wait` 会随唤醒下发 `agentToken`，`agy-reply-and-wait.mjs` 也会按 `--key` 自动校正；仍失败时检查 `state/social-v2.json` 是否存在该会话。
+- 私聊或群聊返回 403 时，核对本次唤醒下发的 `key` 与 `agentToken`，使用同一条唤醒的参数重试。
 - NapCat 端口在但不回消息：多为 NTQQ 内核假死，`ensure-daemons.ps1` 的 `no_cache` 探针会自动 `-ForceRestartNapCat`。

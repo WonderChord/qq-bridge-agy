@@ -1790,7 +1790,7 @@ button:active:not(:disabled) {
       </div>
       <div id="connectionAlert" class="connection-alert" role="alert" hidden></div>
       <div id="overviewSummary" class="overview-summary span-all" data-page="overview">
-        <div class="metric"><span>DSH 连接</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
+        <div class="metric"><span>聊天后端</span><strong id="metricDsh">连接中</strong><small id="metricDshHint">等待服务响应</small></div>
         <div class="metric"><span>SnowLuma 上游</span><strong id="metricSnowluma">读取中</strong><small id="metricSnowlumaHint">等待网关健康上报</small></div>
         <div class="metric"><span>当前运行模式</span><strong id="metricMode">—</strong><small id="metricRole">正在读取角色</small></div>
         <button class="metric metric-link" data-view="sessions"><span>已建立会话</span><strong id="metricSessions">—</strong><small>查看会话映射 <span aria-hidden="true">↗</span></small></button>
@@ -2055,6 +2055,17 @@ button:active:not(:disabled) {
 
       </div></details>
 <details class="settings-group"><summary>语音库与语音发送（调试）</summary><div class="settings-content">
+      <div class="row">
+        <label><input type="checkbox" id="v2VoiceEnabled"> 启用 AI 语音</label>
+        <label><input type="checkbox" id="v2TtsEnabled"> 允许将台词合成为语音条</label>
+      </div>
+      <div class="row">
+        <label for="v2TtsProvider">TTS 提供商</label>
+        <select id="v2TtsProvider"><option value="google">Google</option><option value="elevenlabs">ElevenLabs</option></select>
+        <label for="v2TtsVoiceId">ElevenLabs voice ID</label>
+        <input type="text" id="v2TtsVoiceId" maxlength="128" placeholder="选择 ElevenLabs 时填写">
+      </div>
+      <p class="meta">允许 Worker 发语音时，同时打开工具列表中的 <code>qq_send_voice</code>。ElevenLabs 密钥由桥接进程读取。点「保存当前参数」后生效。</p>
       <div class="meta" style="margin-bottom:8px">
         语音库目录：<code>qq-bridge/audio/</code>（改 <code>socialV2.voice.dir</code> 可换）。把音频文件丢进去即可被 AI 用 <code>qq_send_voice</code> 发出；
         本面板用于调试与试发 —— 试发走的是与 AI 通道相同的解析/校验/限流路径（<code>/api/voice/send</code>），只是由你在控制台触发。
@@ -3270,8 +3281,13 @@ async function loadV2Config() {
     document.getElementById('v2Enabled').checked = c.enabled !== false;
     document.getElementById('v2AgentPreset').value = c.agentPreset || '';
     document.getElementById('v2ProvideRecommendations').checked = c.provideRecommendations !== false;
+    document.getElementById('v2VoiceEnabled').checked = c.voice?.enabled === true;
+    document.getElementById('v2TtsEnabled').checked = c.tts?.enabled ?? !!c.tts?.provider;
+    document.getElementById('v2TtsProvider').value = c.tts?.provider || 'google';
+    document.getElementById('v2TtsVoiceId').value = c.tts?.elevenlabs?.voiceId || '';
     document.querySelectorAll('[data-v2-tool]').forEach(el => {
-      el.checked = (c.tools && c.tools[el.dataset.v2Tool] !== false);
+      const name = el.dataset.v2Tool;
+      el.checked = c.tools?.[name] ?? !['sendVoice', 'setStickerRemark'].includes(name);
     });
     const w = c.wake || {};
     document.getElementById('v2WakeDefaultMode').value = w.defaultMode === 'active' ? 'active' : 'diving';
@@ -3349,6 +3365,12 @@ async function saveV2Config() {
   const body = {
     enabled: document.getElementById('v2Enabled').checked,
     agentPreset: document.getElementById('v2AgentPreset').value.trim(),
+    voice: { enabled: document.getElementById('v2VoiceEnabled').checked },
+    tts: {
+      enabled: document.getElementById('v2TtsEnabled').checked,
+      provider: document.getElementById('v2TtsProvider').value,
+      elevenlabs: { voiceId: document.getElementById('v2TtsVoiceId').value.trim() },
+    },
     provideRecommendations: document.getElementById('v2ProvideRecommendations').checked,
     autoReplyCheckMs: Math.round(Number(document.getElementById('v2AutoReplyCheckSec').value) || 30) * 1000,
     tools,
@@ -4481,11 +4503,18 @@ document.querySelector('.skip-link').addEventListener('click', event => {
 });
 function updateOverview(status, modeLabel) {
   const connection = document.getElementById('statusText');
-  connection.textContent = status.dshReady ? 'DSH 已连接' : 'DSH 未连接';
-  connection.className = 'status-badge ' + (status.dshReady ? 'online' : 'offline');
-  document.getElementById('metricDsh').textContent = status.dshReady ? '已连接' : '未连接';
-  document.getElementById('metricDsh').className = status.dshReady ? 'ok' : 'err';
-  document.getElementById('metricDshHint').textContent = status.dshReady ? '桥接状态已同步' : '请检查 DSH 是否运行';
+  const agy = status.backend === 'agy';
+  const workers = status.workers || {};
+  const ready = status.dshReady && (!agy || workers.waiting > 0 || workers.busy > 0);
+  const label = agy ? 'Antigravity' : 'DSH';
+  const state = ready ? '已连接' : (agy && status.dshReady ? '等待 Worker' : '未连接');
+  connection.textContent = label + ' ' + state;
+  connection.className = 'status-badge ' + (ready ? 'online' : 'offline');
+  document.getElementById('metricDsh').textContent = state;
+  document.getElementById('metricDsh').className = ready ? 'ok' : 'err';
+  document.getElementById('metricDshHint').textContent = agy
+    ? `Antigravity · 待命 ${workers.waiting || 0} · 处理 ${workers.busy || 0} · 排队 ${workers.queued || 0}`
+    : (ready ? '桥接状态已同步' : '请检查 DSH 是否运行');
   renderSnowlumaHealth(status.snowluma);
   document.getElementById('metricMode').textContent = modeLabel.replace('模式', '');
   document.getElementById('metricRole').textContent = '角色 · ' + (status.role || '默认人格');

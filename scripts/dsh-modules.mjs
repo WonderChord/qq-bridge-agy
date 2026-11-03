@@ -58,9 +58,9 @@ export function dshModulesDir() {
     }
   }
 
-  throw new Error(
+  throw Object.assign(new Error(
     '无法定位 DSH 安装目录下的 node_modules。\n'
     + '  请设置 DSH_INSTALL_MODULES=<DSH 安装目录>/node_modules 后重试；\n'
     + `  或设置 DSH_HOME 指向 DSH 根目录（当前解析为 ${home}）。`
-  );
+  ), { code: 'DSH_MODULES_NOT_FOUND' });
 }

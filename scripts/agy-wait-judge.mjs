@@ -1,35 +1,10 @@
 // Antigravity Flash 模糊称呼（persona.ambiguousKeywords）零 Token 门控监听与回传脚本（内置 20 轮无状态换新防上下文膨胀）。
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ROOT, loadConfig, readConsoleToken } from './bridge-local.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
 const TURN_STATE_FILE = path.join(ROOT, 'state', 'agy-judge-turns.json');
 const DEFAULT_MAX_TURNS = 30;
-
-function loadConfig() {
-  try {
-    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-function readConsoleToken() {
-  try {
-    const c = loadConfig();
-    const configured = String(c.consoleToken ?? '').trim();
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;
-  } catch {}
-  try {
-    return fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
 
 function parseArgs(argv) {
   let id = '';
@@ -68,7 +43,7 @@ async function main() {
   if (pendingDecideId && maxTurns > 0 && turnsCompleted >= maxTurns) {
     const cfg = loadConfig();
     const port = Number(cfg.consolePort) || 3100;
-    const token = readConsoleToken();
+    const token = readConsoleToken(cfg);
     try {
       await fetch(`http://127.0.0.1:${port}/api/agy/judge-result`, {
         method: 'POST',
@@ -89,7 +64,7 @@ async function main() {
   while (true) {
     const cfg = loadConfig();
     const port = Number(cfg.consolePort) || 3100;
-    const token = readConsoleToken();
+    const token = readConsoleToken(cfg);
     const qs = new URLSearchParams({ timeoutMs: '55000' });
     if (pendingDecideId) {
       qs.set('decideId', pendingDecideId);

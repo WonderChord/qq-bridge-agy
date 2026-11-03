@@ -20,7 +20,7 @@ inheritMcp: false
 
 2. **唤醒响应（每轮只调 1 次命令）**：
    - 只处理快照 `messages` 里的新消息，`recent` 仅供理解语境。
-   - **按需看图**：对方明确让你看图、或创作者发图时，先执行 `node "<QQ_BRIDGE_DIR>\scripts\agy-get-image.mjs" --key "<Key>" --msg "<msgId>"` 落盘，再用 `view_file` 查看。
+   - **按需看图**：对方明确让你看图、或创作者发图时，先执行 `node "<QQ_BRIDGE_DIR>\scripts\agy-get-image.mjs" --key "<Key>" --token "<Token>" --msg "<msgId>"` 落盘，再用 `view_file` 查看。
    - 调 1 次 `run_command`（`WaitMsBeforeAsync: 1000`）执行 `agy-reply-and-wait.mjs`，转入后台后输出 `OK` 结束回合：
      - **单目标回复（群聊带 `--reply "<msgId>"` 防串行）**：
        `node "<QQ_BRIDGE_DIR>\scripts\agy-reply-and-wait.mjs" --worker-id w1 --max-turns 25 --priority 10 --finish-turn "<Turn>" --key "<Key>" --token "<Token>" --seq <readThroughSeq> --reply "<msgId>" "短句" --sticker "<短id>"`
@@ -29,7 +29,7 @@ inheritMcp: false
        `node "<QQ_BRIDGE_DIR>\scripts\agy-reply-and-wait.mjs" --worker-id w1 --max-turns 25 --priority 10 --finish-turn "<Turn>" --key "<Key>" --token "<Token>" --seq <readThroughSeq> --batch '[{"reply":"<msgId1>","messages":["回第一人"]},{"reply":"<msgId2>","messages":["回第二人"],"tts":"语音短句"}]'`
      - **无需插嘴，静默已读**：
        `node "<QQ_BRIDGE_DIR>\scripts\agy-reply-and-wait.mjs" --worker-id w1 --max-turns 25 --priority 10 --finish-turn "<Turn>" --key "<Key>" --token "<Token>" --seq <readThroughSeq> --no-reply`
-   - 表情只用已注入清单里的真实短 ID。`--token` 传错时脚本会按 `--key` 自动校正。
+   - 表情只用已注入清单里的真实短 ID。`--token` 使用本次唤醒随附的会话令牌。
 
 3. **满轮换新**：
    - 输出包含 `=== WORKER_ROTATE_NEEDED` 时不再调用任何工具，直接输出 `[ROTATE:w1] 已满轮请求销毁换新` 结束本子代理。

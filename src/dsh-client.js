@@ -297,8 +297,9 @@ function waitWithSignal(promise, signal) {
 }
 
 export class AgyApiClient {
-  constructor(baseUrl = 'agy://local') {
+  constructor(baseUrl = 'agy://local', turnsFile = AGY_WORKER_TURNS_FILE) {
     this.baseUrl = String(baseUrl);
+    this._turnsFile = turnsFile;
     this.isAgyBackend = true;
     this._sessions = new Map();
     this._follows = new Set();
@@ -311,7 +312,6 @@ export class AgyApiClient {
     this._workerTurns = new Map(); // workerId -> deliveredTurns
     this._allowedWorkers = new Set(['primary', 'w1', 'w2']);
     this._loadWorkerTurns();
-    this._turnSeq = 0;
     this.onWorkerAvailable = null;
     this.onWorkerRotated = null;
 
@@ -353,7 +353,7 @@ export class AgyApiClient {
       selectModel: async () => ok({ selected: { provider: 'antigravity', model: 'gemini' } }),
       prompt: async ({ sessionId, content } = {}) => {
         const meta = this._sessions.get(sessionId);
-        const turn = `agy-turn-${++this._turnSeq}`;
+        const turn = `agy-turn-${randomUUID()}`;
         // 黑话后台提取会话：自动返回空候选数组，避免阻塞或额外消耗会话轮次
         if (meta?.title && String(meta.title).includes('黑话')) {
           queueMicrotask(() => {
@@ -369,7 +369,6 @@ export class AgyApiClient {
           });
           return ok({});
         }
-        this._pruneStaleTurns();
         const hadActive = this.activeTurnCount(sessionId) > 0;
         const wakeId = randomUUID();
         const turnEntry = { sessionId, turn, wakeId, workerId: '', startedAt: Date.now() };
@@ -451,18 +450,23 @@ export class AgyApiClient {
 
   _pruneStaleTurns(maxAgeMs = 75000) {
     const now = Date.now();
-    const expiredSids = new Set();
+    const expiredSids = new Map();
     for (const [t, info] of this._activeTurns.entries()) {
-      if (now - info.startedAt > maxAgeMs) {
+      // 离线积压仍可领取，执行租约从 worker 领到唤醒时开始。
+      if (info.workerId && now - info.startedAt > maxAgeMs) {
         this._activeTurns.delete(t);
-        expiredSids.add(info.sessionId);
+        this._completedTurns.set(t, now);
+        expiredSids.set(info.sessionId, t);
       }
     }
-    for (const sid of expiredSids) {
-      if (this.activeTurnCount(sid) === 0) {
+    for (const [turn, at] of this._completedTurns) {
+      if (now - at > 7_200_000) this._completedTurns.delete(turn);
+    }
+    for (const [sid, turn] of expiredSids) {
+      if (![...this._activeTurns.values()].some((entry) => entry.sessionId === sid)) {
         this._emitSessionEvent(sid, {
           type: 'turn/end',
-          data: { turn: `stale-${Date.now()}`, reason: { kind: 'completed' } },
+          data: { turn, reason: { kind: 'aborted' } },
         });
       }
     }
@@ -488,22 +492,29 @@ export class AgyApiClient {
     return n;
   }
 
-  isTurnActive(turn) {
+  isTurnActive(turn, sessionId) {
     this._pruneStaleTurns();
-    return Boolean(turn && this._activeTurns.has(String(turn)));
+    const active = this._activeTurns.get(String(turn));
+    return !!active && (sessionId === undefined || sessionId === active.sessionId);
   }
 
   isTurnCompleted(turn) {
     if (!turn) return false;
-    const now = Date.now();
-    for (const [k, at] of this._completedTurns.entries()) {
-      if (now - at > 7_200_000) this._completedTurns.delete(k);
-    }
+    this._pruneStaleTurns();
     return this._completedTurns.has(String(turn));
   }
 
   waitingListenerCount() {
     return this._wakeWaiters.size;
+  }
+
+  claimTurn(turn, sessionId, workerId) {
+    this._pruneStaleTurns();
+    const active = this._activeTurns.get(turn);
+    if (!active || active.sessionId !== sessionId || active.workerId !== workerId) return 'stale';
+    if (active.claimed) return 'duplicate';
+    active.claimed = true;
+    return 'claimed';
   }
 
   async stopSessionWork(sessionId) {
@@ -514,6 +525,7 @@ export class AgyApiClient {
     for (const [t, info] of this._activeTurns.entries()) {
       if (info.sessionId === sessionId) {
         lastTurn = info.turn;
+        this._completedTurns.set(t, Date.now());
         this._activeTurns.delete(t);
       }
     }
@@ -527,9 +539,7 @@ export class AgyApiClient {
   }
 
   completeTurn({ sessionId, turn, workerId = '', replyText = '', all = false } = {}) {
-    if (turn) {
-      this._completedTurns.set(String(turn), Date.now());
-    }
+    this._pruneStaleTurns();
     const targets = [];
     for (const [t, info] of this._activeTurns.entries()) {
       if (all) {
@@ -542,6 +552,8 @@ export class AgyApiClient {
         targets.push([t, info]);
       }
     }
+    const finishedTurns = new Set(targets.map(([t]) => t));
+    this._wakeQueue = this._wakeQueue.filter((item) => !finishedTurns.has(item.turn));
     const completed = [];
     const affectedSids = new Set();
     for (const [t, info] of targets) {
@@ -572,8 +584,8 @@ export class AgyApiClient {
 
   _loadWorkerTurns() {
     try {
-      if (!fs.existsSync(AGY_WORKER_TURNS_FILE)) return;
-      const raw = fs.readFileSync(AGY_WORKER_TURNS_FILE, 'utf8').replace(/^\uFEFF/, '');
+      if (!fs.existsSync(this._turnsFile)) return;
+      const raw = fs.readFileSync(this._turnsFile, 'utf8').replace(/^\uFEFF/, '');
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
         for (const [k, v] of Object.entries(parsed)) {
@@ -586,8 +598,10 @@ export class AgyApiClient {
 
   _saveWorkerTurns() {
     try {
-      fs.mkdirSync(path.dirname(AGY_WORKER_TURNS_FILE), { recursive: true });
-      fs.writeFileSync(AGY_WORKER_TURNS_FILE, JSON.stringify(Object.fromEntries(this._workerTurns), null, 2), 'utf8');
+      fs.mkdirSync(path.dirname(this._turnsFile), { recursive: true });
+      const tmp = this._turnsFile + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(this._workerTurns), null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, this._turnsFile);
     } catch {}
   }
 
@@ -642,7 +656,8 @@ export class AgyApiClient {
     if (this._wakeQueue.length > 0) {
       const item = this._wakeQueue.shift();
       const active = this._activeTurns.get(item.turn);
-      if (active) active.workerId = wid;
+      active.workerId = wid;
+      active.startedAt = Date.now();
       const nextCount = doneTurns + 1;
       this._workerTurns.set(wid, nextCount);
       this._saveWorkerTurns();

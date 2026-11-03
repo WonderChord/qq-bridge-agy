@@ -9,6 +9,8 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
 3. 安装插件：`powershell -ExecutionPolicy Bypass -File agy-plugin/install.ps1`，在 Antigravity 插件管理里启用 `qq-bridge`。
 4. 新开一个干净的 Antigravity 窗口，说「启动 QQ 机器人全自动值守」，总控会按 `qq-bot-operator` 技能拉起三个子代理。
 
+新安装默认进入二代仿真模式。已有安装沿用控制台保存的模式，使用值守 Worker 时选择「二代仿真」。控制台的「聊天后端」显示待命数、处理数和积压数。
+
 ## 线程分工
 
 | 子代理 | 模型 | 作用 | 换新 |
@@ -40,7 +42,7 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
 ```
 
 - `nameKeywords` 命中视为点名；`ambiguousKeywords` 命中后交给 Flash 预筛判断是否真在叫机器人。
-- `creatorUids` 缺省取 `ownerQQ`，拥有外包画图（`--codex-draw`）权限。
+- `creatorUids` 留空时取 `ownerQQ`，拥有外包画图（`--codex-draw`）权限。
 - 每个记忆舱位 = `<dir>/summary.md` + `<dir>/diary/`，多个会话可共用同一个 `dir`；未列出的会话不做归纳。
 
 ## `napcat`：无头 NapCat 守护
@@ -59,15 +61,20 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
 }
 ```
 
+守护脚本从上述配置读取账号和 WebUI 凭据，兼容已有的 `state/napcat-auth.json`。目录路径相对于仓库根目录。
+
 ## `socialV2.tts`：QQ 语音条
 
 `agy-reply-and-wait.mjs --tts "台词"` → `POST /api/socialV2/send-tts` → 合成 MP3 → NapCat `record` 段发出原生语音条。
+
+在控制台「二代仿真」的工具列表勾选 `qq_send_voice`，再在「语音库与语音发送」打开 AI 语音和台词合成，选择提供商后保存。保存立即生效。已有配置的备用提供商、模型、音量和额度会保留。
 
 ```json
 "socialV2": {
   "tools": { "sendVoice": true },
   "voice": { "enabled": true, "maxPerMinute": 4, "maxPerHour": 30 },
   "tts": {
+    "enabled": true,
     "provider": "elevenlabs",
     "fallbackProvider": "google",
     "elevenlabs": { "voiceId": "<你的 voiceId>", "modelId": "eleven_v3" },
@@ -82,4 +89,4 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
 
 ## `codexDraw`：外包画图
 
-`--codex-draw '{"prompt":"…","selfRef":true}'` 调用本机已登录的 Codex CLI 生图，约 45 秒后自动引用创作者发出。`selfRef` 会挂载 `persona.selfRefs` 并前置 `persona.appearanceAnchor`。`codexDraw.invokeScript` 默认指向仓库自带的 `scripts/Invoke-CodexImage.ps1`（需 PowerShell 7）。
+`--codex-draw '{"prompt":"…","selfRef":true}'` 调用本机已登录的 Codex CLI 生图，完成后发回原会话。群聊需用 `--reply` 引用最近三分钟内创作者在本群发出的消息，私聊按创作者 QQ 号授权。`selfRef` 会挂载 `persona.selfRefs` 并前置 `persona.appearanceAnchor`。`codexDraw.invokeScript` 默认指向仓库自带的 `scripts/Invoke-CodexImage.ps1`（需 PowerShell 7）。

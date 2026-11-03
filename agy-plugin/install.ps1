@@ -1,4 +1,4 @@
-# 将插件安装到 Antigravity：复制 agy-plugin/ 到 ~/.gemini/config/plugins/qq-bridge，并把 <QQ_BRIDGE_DIR> 替换成本仓库的实际路径。
+﻿# 将插件安装到 Antigravity：复制 agy-plugin/ 到 ~/.gemini/config/plugins/qq-bridge，并把 <QQ_BRIDGE_DIR> 替换成本仓库的实际路径。
 param(
   [string]$Target = (Join-Path $HOME '.gemini\config\plugins\qq-bridge')
 )

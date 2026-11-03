@@ -1,33 +1,7 @@
 // Antigravity 旁路异步记忆归纳监听脚本（零轮询、零聊天阻塞）。
-import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ROOT, loadConfig, readConsoleToken } from './bridge-local.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
-
-function loadConfig() {
-  try {
-    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-function readConsoleToken() {
-  try {
-    const c = loadConfig();
-    const configured = String(c.consoleToken ?? '').trim();
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;
-  } catch {}
-  try {
-    return fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -39,7 +13,7 @@ async function main() {
   while (true) {
     const cfg = loadConfig();
     const port = Number(cfg.consolePort) || 3100;
-    const token = readConsoleToken();
+    const token = readConsoleToken(cfg);
     const qs = new URLSearchParams({ timeoutMs: '55000' });
     if (doneId) qs.set('doneId', doneId);
 

@@ -4,33 +4,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ROOT, loadConfig, readConsoleToken, sessionToken } from './bridge-local.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
-
-function loadConfig() {
-  try {
-    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-function readConsoleToken() {
-  try {
-    const c = loadConfig();
-    const configured = String(c.consoleToken ?? '').trim();
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;
-  } catch {}
-  try {
-    return fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
 
 function parseArgs(argv) {
   const opts = { key: '', token: '', messageId: '' };
@@ -45,20 +20,11 @@ function parseArgs(argv) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (!opts.messageId) {
-    console.error('用法: node scripts/agy-get-image.mjs --key "<Key>" --token "<Token>" --msg "<messageId>"');
-    process.exit(1);
-  }
-  if (opts.key) {
-    try {
-      const s = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'social-v2.json'), 'utf8')) || {};
-      const conv = (s.conversations || s.sessions || s)[opts.key];
-      if (conv?.agentToken) opts.token = conv.agentToken;
-    } catch {}
-  }
+  if (!/^-?[1-9]\d*$/.test(opts.messageId)) throw new Error('--msg 必须为非零整数消息 ID');
+  opts.token = sessionToken(opts.key, opts.token);
   const cfg = loadConfig();
   const port = Number(cfg.consolePort) || 3100;
-  const consoleToken = readConsoleToken();
+  const consoleToken = readConsoleToken(cfg);
   const q = new URLSearchParams({ key: opts.key, messageId: String(opts.messageId) });
   const headers = {};
   if (consoleToken) headers['x-console-token'] = consoleToken;
@@ -69,6 +35,7 @@ async function main() {
     signal: AbortSignal.timeout(30000),
   });
   const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.ok === false) throw new Error(data.error || 'HTTP ' + res.status);
   const images = Array.isArray(data?.images) ? data.images : [];
   if (!images.length) {
     console.log(`消息 ${opts.messageId} 没有可返回的图片/表情：${data?.note || data?.error || '未找到'}`);

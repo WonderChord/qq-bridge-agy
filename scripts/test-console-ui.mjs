@@ -147,7 +147,7 @@ try {
   // state/ 的 ACL 收紧需要管理员权限，未提权时桥接会明确报告 hardened:false。
   // 控制台必须把这件事**显式**呈现（含可复制的提权命令），而不是让用户以为已经安全；
   // 用户按提示处理后点「重新检测」应当转为成功态。
-  await test('Unhardened state directory surfaces a warning with the exact command', async () => {
+  if (!original) await test('Unhardened state directory surfaces a warning with the exact command', async () => {
     await navigate('access');
     await page.waitForFunction(() => document.getElementById('stateDirWarn')?.style.display !== 'none');
     const shown = await page.evaluate(() => ({
@@ -248,9 +248,51 @@ try {
     assert(results.every(x => x.ok), 'Cannot record a baseline from a failed suite');
     await writeFile(baselinePath, JSON.stringify(fixture.requests, null, 2) + '\n');
     console.log(`Recorded original API contracts: ${baselinePath}`);
-  } else await test('All submitted payloads exactly match the pre-redesign console baseline', async () => {
+  } else await test('控制台沿用原表单协议，新增 ACL 操作和语音默认值单独对账', async () => {
     const expected = JSON.parse(await readFile(baselinePath, 'utf8'));
+    if (!original) {
+      const firstV2 = expected.findIndex((r) => r.path === '/api/socialV2/config');
+      expected.splice(firstV2, 0, { method: 'POST', path: '/api/security', body: { rehardenStateDir: true } });
+      for (const r of expected.filter((r) => r.path === '/api/socialV2/config')) {
+        r.body.tools.sendVoice = false;
+        r.body.tools.setStickerRemark = false;
+        r.body.voice = { enabled: false };
+        r.body.tts = { enabled: false, provider: 'google', elevenlabs: { voiceId: '' } };
+      }
+    }
     assert.deepEqual(fixture.requests, expected);
+  });
+
+  if (!original) await test('AGY 控制台区分待命、忙碌与无人监听', async () => {
+    const route = '**/api/status';
+    const workers = { waiting: 0, busy: 0, queued: 2 };
+    await page.route(route, (r) => r.fulfill({ json: { backend: 'agy', dshReady: true, mode: 'reserved2', workers } }));
+    try {
+      await page.evaluate('refresh()');
+      assert.match(await page.textContent('#statusText'), /Antigravity 等待 Worker/);
+      assert.match(await page.textContent('#metricDshHint'), /排队 2/);
+      workers.busy = 1;
+      await page.evaluate('refresh()');
+      assert.match(await page.textContent('#statusText'), /Antigravity 已连接/);
+      workers.waiting = 1;
+      workers.busy = 0;
+      await page.evaluate('refresh()');
+      assert.match(await page.textContent('#metricDshHint'), /待命 1/);
+    } finally {
+      await page.unroute(route);
+      await page.evaluate('refresh()');
+    }
+  });
+
+  if (!original) await test('从二代配置页启用 TTS 并选择音色', async () => {
+    await navigate('social-v2');
+    await check('v2VoiceEnabled', true);
+    await check('v2TtsEnabled', true);
+    await page.selectOption('#v2TtsProvider', 'elevenlabs');
+    await fill('v2TtsVoiceId', 'fixture-voice');
+    const body = await clickWrite('#v2ConfigSaveTop', '/api/socialV2/config');
+    assert.deepEqual(body.voice, { enabled: true });
+    assert.deepEqual(body.tts, { enabled: true, provider: 'elevenlabs', elevenlabs: { voiceId: 'fixture-voice' } });
   });
 
   if (!original) await test('Token usage panel renders totals, per-conversation and per-turn cost', async () => {

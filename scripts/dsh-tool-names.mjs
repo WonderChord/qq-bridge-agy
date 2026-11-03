@@ -102,6 +102,7 @@ export function collectDshToolNames({ packagesDir, pluginDirs } = {}) {
       const pkgDir = path.join(dir, e.name);
       packages.push(e.name);
       for (const f of walkFiles(pkgDir)) {
+        if (!/\.(?:js|mjs|cjs|d\.ts|patch\.ya?ml)$/.test(f)) continue;
         let text = '';
         try { text = fs.readFileSync(f, 'utf8'); } catch { continue; }
         if (/\.(js|mjs|cjs)$/.test(f) || f.endsWith('.d.ts')) extractFromSource(text, e.name, add);

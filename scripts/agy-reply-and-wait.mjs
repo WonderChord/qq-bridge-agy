@@ -6,35 +6,9 @@
 //   2) 一轮同时回复多个群友（--batch JSON 数组，按顺序高速连发不同引用/点名）：
 //      node scripts/agy-reply-and-wait.mjs --worker-id w2 --finish-turn "agy-turn-12" --key "group:123456789" --token "<token>" --seq 245 --batch "[{\"reply\":\"101\",\"messages\":[\"第一人回复\"]},{\"reply\":\"102\",\"messages\":[\"第二人回复\"]}]"
 
-import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { ROOT, loadConfig, readConsoleToken, sessionToken } from './bridge-local.mjs';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, '..');
-
-function loadConfig() {
-  try {
-    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
-    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
-    return JSON.parse(text);
-  } catch {
-    return {};
-  }
-}
-
-function readConsoleToken() {
-  try {
-    const c = loadConfig();
-    const configured = String(c.consoleToken ?? '').trim();
-    if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;
-  } catch {}
-  try {
-    return fs.readFileSync(path.join(ROOT, 'state', 'console-token'), 'utf8').trim();
-  } catch {
-    return '';
-  }
-}
 
 function parseArgs(argv) {
   const opts = {
@@ -84,7 +58,7 @@ function parseArgs(argv) {
     else if (a === '--no-reply' || a === '--silent' || a === '--skip' || a === '--mark-read') opts.noReply = true;
     else if (/^--[a-z]/i.test(a)) {
       // 严禁把模型臆造的未知 CLI flag（如 --quiet 等）当作聊天文本发进 QQ 群！
-      console.error(`[agy-reply-and-wait] 已拦截未知参数防止误发到群内: ${a}`);
+      throw new Error('未知或缺值的参数：' + a);
     }
     else opts.messages.push(a);
   }
@@ -94,83 +68,13 @@ function parseArgs(argv) {
     opts.sticker = null;
     opts.image = null;
     opts.tts = null;
+    opts.codexDraws = [];
+    opts.collectStickers = [];
   }
   return opts;
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function getBridgeBootSig() {
-  try {
-    const lockFile = path.join(ROOT, 'state', 'bridge.lock');
-    const st = fs.statSync(lockFile);
-    const pid = fs.readFileSync(lockFile, 'utf8').trim();
-    return `${pid}_${Math.floor(st.mtimeMs)}`;
-  } catch {
-    return 'noboot';
-  }
-}
-
-// 客户端回合级强幂等账本：防止 LLM 在 run_command 转入后台后幻觉重发同一条 --finish-turn 命令导致一模一样的话发两遍
-function claimClientTurnOnce(opts) {
-  if (!opts.finishTurn || !(opts.key && opts.token)) return { duplicate: false };
-  const ledgerFile = path.join(ROOT, 'state', 'agy-turn-ledger.json');
-  const now = Date.now();
-  const bootSig = getBridgeBootSig();
-  const turnKey = `${bootSig}::${opts.finishTurn}`;
-  let ledger = {};
-  try {
-    if (fs.existsSync(ledgerFile)) {
-      ledger = JSON.parse(fs.readFileSync(ledgerFile, 'utf8')) || {};
-    }
-  } catch {
-    ledger = {};
-  }
-  for (const [k, v] of Object.entries(ledger)) {
-    const at = Number(v?.at || v || 0);
-    if (!at || now - at > 7_200_000) delete ledger[k];
-  }
-  if (ledger[turnKey]) {
-    return { duplicate: true, prev: ledger[turnKey] };
-  }
-  ledger[turnKey] = { workerId: opts.workerId, key: opts.key, seq: opts.seq, at: now };
-  try {
-    fs.mkdirSync(path.dirname(ledgerFile), { recursive: true });
-    fs.writeFileSync(ledgerFile, JSON.stringify(ledger, null, 2), 'utf8');
-  } catch {}
-  return { duplicate: false };
-}
-
-// 分舱长期记忆：config.json → persona.memoryCompartments（{ "<key>": { "dir": "memory/xxx" } }）
-function compartmentSummaryPath(key) {
-  const raw = loadConfig()?.persona?.memoryCompartments?.[key];
-  if (!raw || !raw.dir) return '';
-  return path.join(path.resolve(ROOT, String(raw.dir)), String(raw.summaryFile || 'summary.md'));
-}
-
-function injectWorkerSyncedMemory(workerId, key, wakeText) {
-  const summaryPath = compartmentSummaryPath(key);
-  if (!summaryPath || !fs.existsSync(summaryPath)) return '';
-  if (String(wakeText || '').includes('【本会话分舱长期记忆精华')) return '';
-  try {
-    const mtime = String(Math.floor(fs.statSync(summaryPath).mtimeMs));
-    const stateFile = path.join(ROOT, 'state', 'agy-worker-mem-sig.json');
-    let state = {};
-    try {
-      state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-    } catch {}
-    const sigKey = `${workerId}::${key}`;
-    if (state[sigKey] === mtime) return '';
-    const memText = fs.readFileSync(summaryPath, 'utf8').trim().slice(0, 1600);
-    state[sigKey] = mtime;
-    fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
-    if (!memText) return '';
-    return `\n【本会话分舱长期记忆精华（仅限 ${key} 使用，严禁跨群串台）】\n${memText}\n`;
-  } catch {
-    return '';
-  }
-}
 
 async function postBridge(port, consoleToken, agentToken, route, body) {
   const headers = { 'content-type': 'application/json' };
@@ -180,7 +84,7 @@ async function postBridge(port, consoleToken, agentToken, route, body) {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20000),
+    signal: AbortSignal.timeout(route === '/api/socialV2/send-tts' ? 150000 : 20000),
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.ok === false) {
@@ -226,22 +130,10 @@ async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTu
         const w = data.wake;
         const tokMatch = /(?:【会话令牌】|会话令牌\s*[:：]\s*)([A-Za-z0-9_-]{16,64})/.exec(String(w.text || ''));
         const extractedToken = w.agentToken || (tokMatch ? tokMatch[1] : '');
-        if (w.key && extractedToken) {
-          try {
-            const tf = path.join(ROOT, 'state', 'agy-agent-tokens.json');
-            let map = {};
-            try { map = JSON.parse(fs.readFileSync(tf, 'utf8')) || {}; } catch {}
-            map[w.key] = extractedToken;
-            fs.mkdirSync(path.dirname(tf), { recursive: true });
-            fs.writeFileSync(tf, JSON.stringify(map, null, 2), 'utf8');
-          } catch {}
-        }
         console.log(`=== QQ 唤醒 [${workerId}${w.workerTurnIndex ? ` | ${w.workerTurnIndex}/${effectiveMaxTurns || '∞'}` : ''}] Key=${w.key ?? '-'} Turn=${w.turn} Token=${extractedToken || '-'} ===`);
         if (w.imageCount > 0) {
           console.log(`媒体: ${w.imageCount}张（需看图时: node "${path.join(ROOT, 'scripts')}\\agy-get-image.mjs" --key "${w.key}" --token "${extractedToken || '<Token>'}" --msg "<msgId>"）`);
         }
-        const extraMem = injectWorkerSyncedMemory(workerId, w.key, w.text);
-        if (extraMem) console.log(extraMem);
         console.log(w.text);
         process.exit(0);
       }
@@ -253,31 +145,20 @@ async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTu
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  if (opts.key) {
-    try {
-      const s = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'social-v2.json'), 'utf8')) || {};
-      const conv = (s.conversations || s.sessions || s)[opts.key];
-      if (conv?.agentToken) opts.token = conv.agentToken;
-    } catch {}
-    if (!opts.token || opts.token === '-' || opts.token.startsWith('agy-')) {
-      try {
-        const tf = path.join(ROOT, 'state', 'agy-agent-tokens.json');
-        const map = JSON.parse(fs.readFileSync(tf, 'utf8')) || {};
-        if (map[opts.key]) opts.token = map[opts.key];
-      } catch {}
-    }
-  }
-  const claim = claimClientTurnOnce(opts);
-  if (claim.duplicate) {
-    console.log(`[agy-reply-and-wait] 🛡️ 幂等保护：回合 ${opts.finishTurn} 已由前序后台任务执行并挂起监听，本次重复调用已自动忽略（无需再调任何工具，请直接回复一句简短文本结束本回合）。`);
-    process.exit(0);
-  }
-  if (opts.key && opts.token) {
-    console.log(`[agy-reply-and-wait] ✅ [${opts.workerId}] 已接管回合 ${opts.finishTurn || '-'} (seq=${opts.seq ?? '-'})，正在提交并转入后台监听（请勿重复调用 run_command）...`);
-  }
+  if (opts.key) opts.token = sessionToken(opts.key, opts.token);
   const cfg = loadConfig();
   const port = Number(cfg.consolePort) || 3100;
-  const consoleToken = readConsoleToken();
+  const consoleToken = readConsoleToken(cfg);
+  if (opts.finishTurn && opts.key) {
+    const claim = await postBridge(port, consoleToken, '', '/api/agy/claim', {
+      key: opts.key, token: opts.token, workerId: opts.workerId, turn: opts.finishTurn,
+    });
+    if (claim.duplicate) {
+      console.log('[agy-reply-and-wait] 此回合已有回复任务，重复调用已忽略。');
+      return;
+    }
+  }
+  let failed = false;
 
   if (opts.key && opts.token) {
     try {
@@ -298,6 +179,7 @@ async function main() {
           usage,
         });
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] 收藏表情未成功 (${msgRef}): ${err?.message ?? err}`);
       }
     }
@@ -348,6 +230,7 @@ async function main() {
             try {
               await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
             } catch (err) {
+              failed = true;
               console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err?.message ?? err}`);
             }
           }
@@ -358,6 +241,7 @@ async function main() {
             try {
               await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-sticker', sp);
             } catch (err) {
+              failed = true;
               console.error(`[agy-reply-and-wait] 批量表情发送警告 (${item.sticker}): ${err?.message ?? err}`);
             }
           }
@@ -368,6 +252,7 @@ async function main() {
             try {
               await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-image', ip);
             } catch (err) {
+              failed = true;
               console.error(`[agy-reply-and-wait] 批量图片发送警告: ${err?.message ?? err}`);
             }
           }
@@ -378,6 +263,7 @@ async function main() {
             try {
               await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
             } catch (err) {
+              failed = true;
               console.error(`[agy-reply-and-wait] 批量语音发送警告: ${err?.message ?? err}`);
             }
           }
@@ -396,6 +282,7 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] 文本发送警告: ${err?.message ?? err}`);
       }
     }
@@ -406,6 +293,7 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-sticker', sp);
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] 表情发送未成功 (${opts.sticker}，已忽略并继续标已读): ${err?.message ?? err}`);
       }
     }
@@ -416,6 +304,7 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-image', ip);
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] 图片发送警告: ${err?.message ?? err}`);
       }
     }
@@ -426,6 +315,7 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] TTS 语音发送警告: ${err?.message ?? err}`);
       }
     }
@@ -441,6 +331,7 @@ async function main() {
       }
       const drawBody = {
         key: opts.key,
+        turn: opts.finishTurn || undefined,
         prompt: String(spec.prompt || '').trim(),
         ...(typeof spec.selfRef === 'boolean' ? { selfRef: spec.selfRef } : {}),
         ...(spec.refMsgId != null ? { refMsgId: String(spec.refMsgId) } : {}),
@@ -453,10 +344,12 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/codex-draw', drawBody);
       } catch (err) {
+        failed = true;
         console.error(`[agy-reply-and-wait] 外包生图提交未通过: ${err?.message ?? err}`);
       }
     }
     } catch (err) {
+      failed = true;
       console.error(`[agy-reply-and-wait] 发送阶段异常 (继续执行标已读防二次提醒唤醒): ${err?.message ?? err}`);
     }
 
@@ -490,25 +383,21 @@ async function main() {
       } else if (Number.isInteger(opts.seq) && opts.seq >= 0) {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/mark-read', {
           key: opts.key,
+          turn: opts.finishTurn || undefined,
           throughSeq: opts.seq,
         });
       }
     } catch (err) {
+      failed = true;
       console.error(`[agy-reply-and-wait] mark-read 警告: ${err?.message ?? err}`);
     }
   }
 
   if (opts.noWait) {
-    await fetch(`http://127.0.0.1:${port}/api/agy/complete`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(consoleToken ? { 'x-console-token': consoleToken } : {}),
-      },
-      body: JSON.stringify({ workerId: opts.workerId, turn: opts.finishTurn }),
-    }).catch(() => {});
-    console.log(`[agy-reply-and-wait] [${opts.workerId}] 已发送并确认已读（--no-wait）`);
-    process.exit(0);
+    await postBridge(port, consoleToken, '', '/api/agy/complete', { workerId: opts.workerId, turn: opts.finishTurn });
+    console.log('[agy-reply-and-wait] 回合已结束（--no-wait）');
+    process.exitCode = failed ? 1 : 0;
+    return;
   }
 
   await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, opts.finishTurn, opts.maxTurns);
