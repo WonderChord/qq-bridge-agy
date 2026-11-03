@@ -1537,6 +1537,17 @@ async function main() {
     }
     const localFiles = scanLocalStickerDir();
     const localByMd5 = new Map(localFiles.map((f) => [f.md5, f]));
+    const localByName = new Map(localFiles.map((f) => [f.name.toLowerCase(), f]));
+    const supersededMd5s = new Set(['2BA024A82EF4D5B70FFF2E10DDA895F7']);
+    for (const e of stickerEntries) {
+      if (e?.localName && e?.md5) {
+        const cur = localByName.get(String(e.localName).toLowerCase());
+        if (cur && cur.md5 !== e.md5) {
+          supersededMd5s.add(e.md5);
+        }
+      }
+    }
+    stickerEntries = stickerEntries.filter((e) => !supersededMd5s.has(String(e?.md5 || '').toUpperCase()));
     const ensureLocalFilesRegistered = () => {
       const mergedMd5 = new Set(stickerEntries.map((e) => e.md5).filter(Boolean));
       let added = 0;
@@ -1600,6 +1611,7 @@ async function main() {
             return { emoji_id: md5, resId: md5, url, md5, desc: '' };
           }
           const md5 = String(item?.md5 || '').trim().toUpperCase();
+          if (md5 && supersededMd5s.has(md5)) return null;
           const lf = md5 ? localByMd5.get(md5) : null;
           return lf ? { ...item, md5, localPath: lf.fullPath, localName: lf.name } : item;
         }).filter(Boolean);
@@ -5509,7 +5521,7 @@ async function main() {
               }
             }
             if (merged.sticker.maxListCount !== undefined) merged.sticker.maxListCount = Math.min(500, Math.max(1, merged.sticker.maxListCount));
-            if (merged.sticker.promptMaxStickers !== undefined) merged.sticker.promptMaxStickers = Math.min(30, Math.max(1, merged.sticker.promptMaxStickers));
+            if (merged.sticker.promptMaxStickers !== undefined) merged.sticker.promptMaxStickers = Math.min(80, Math.max(1, merged.sticker.promptMaxStickers));
             if (merged.sticker.includeInPrompt !== undefined) merged.sticker.includeInPrompt = merged.sticker.includeInPrompt === true;
             if (body.sticker.collect && typeof body.sticker.collect === 'object') {
               merged.sticker.collect = { ...(current.sticker?.collect ?? {}), ...body.sticker.collect };
@@ -5564,8 +5576,26 @@ async function main() {
           const wakeDefaultChanged = body.wake && typeof body.wake === 'object' &&
             WAKE_DEFAULT_KEYS.some((k) => Object.prototype.hasOwnProperty.call(body.wake, k));
           if (wakeDefaultChanged) refreshAllDefaultWakeConfigsV2();
+          if (body.proactive && typeof body.proactive === 'object') {
+            for (const k of socialV2.conversations.keys()) {
+              cancelProactiveCheckV2(k);
+              scheduleProactiveCheckV2(k);
+            }
+          }
           log('控制台：二代仿真配置已更新');
           sendJson({ ok: true, config: consoleSocialV2Config() });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/proactive-now') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const hint = String(body.hint ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '当前不在 reserved2 模式' }, 400); return; }
+          const reason = hint ? `proactiveCheck:${hint.slice(0, 80)}` : 'proactiveCheck';
+          scheduleWakeV2(key, reason, { immediate: true });
+          log(`[reserved2] 手动触发主动冒泡 ${key} (${reason})`);
+          sendJson({ ok: true, key, reason });
           return;
         }
         if (req.method === 'GET' && url.pathname === '/api/socialV2/activity') {
@@ -10601,7 +10631,7 @@ async function main() {
       // offline queue may have received more messages since this wake was queued.
       wakeState = getSocialV2State(key);
       wakeToken = wakeState.agentToken;
-      const allowEmptyUnreadWake = opts.wakeReason === 'bootstrap' || opts.wakeReason === 'proactiveCheck' || opts.wakeReason === 'admin';
+      const allowEmptyUnreadWake = opts.wakeReason === 'bootstrap' || String(opts.wakeReason ?? '').startsWith('proactiveCheck') || opts.wakeReason === 'admin';
       wakeSnapshot = buildWakeSnapshotV2(key, {
         claimSlice: Boolean(api?.isAgyBackend),
       });
@@ -12106,6 +12136,15 @@ async function main() {
       if (reason === 'replyCheck') {
         return `【回复检查】${key}${drawHint}${voiceHint}\n仅明确顺着你追问才带 --reply <msgId> 简短回 1 条；否则直接 --no-reply 标已读。`;
       }
+      if (reason === 'proactiveCheck' || String(reason ?? '').startsWith('proactiveCheck:')) {
+        const customHint = String(reason ?? '').includes(':') ? String(reason).slice(String(reason).indexOf(':') + 1).trim() : '';
+        const hintLine = customHint ? `\n【本次主动冒泡方向】${customHint}` : '';
+        const clockNow = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        if (String(key ?? '').startsWith('private:')) {
+          return `【主动冒泡（私聊搭话）】${key} | 当前时间：${clockNow}${hintLine}\n有一阵子没动静了，这是你主动找对方搭话的机会（快照 messages 为空是正常的，切勿直接 --no-reply）！请结合当前时间点（如早安/饭点/下午摸鱼/深夜抓熬夜）或 recent/分舱记忆里聊过的事，自然随口发 1 句短话（可配 --sticker 或偶尔用 --tts 发条懒洋洋的语音条逗对方，不要带 --reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
+        }
+        return `【主动冒泡（群聊开话题）】${key} | 当前时间：${clockNow}${hintLine}\n群里已经安静了一阵子，这是你主动出来冒泡水群的机会（快照 messages 为空是正常的）！请结合当前时间点、recent 里刚才聊过的话茬或本群熟人老梗，像真人水群一样平地抛 1 句简短吐槽/闲聊或单甩一张应景 --sticker（平地主动开话题不要带 --reply；若实在觉得不适合开口也可 --no-reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
+      }
       return `【唤醒】${key} | 原因：${reason}${triggeredLine}${drawHint}${voiceHint}\n只处理快照 messages 新消息（群聊必带 --reply <msgId>；路过/无需插嘴直接 --no-reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
     }
 
@@ -12608,11 +12647,19 @@ async function main() {
       if (pendingThoughts > 0) prob = Math.min(1, prob * 1.4);
       if (st.lastAiReplyAt && Date.now() - Number(st.lastAiReplyAt) < 30 * 60 * 1000) prob *= 0.5;
       const hour = new Date().getHours();
-      if (hour >= 23 || hour < 8) prob *= 0.3;
+      if (hour >= 1 && hour < 8) prob *= 0.2;
       const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+      const lastMsg = recent.length > 0 ? recent[recent.length - 1] : null;
+      if (lastMsg && lastMsg.isSelf) {
+        const sinceLastSelfMs = Date.now() - Number(lastMsg.time || st.lastAiReplyAt || 0);
+        const cooldownMs = String(key).startsWith('group:') ? 3 * 3600 * 1000 : 2 * 3600 * 1000;
+        if (sinceLastSelfMs < cooldownMs) {
+          prob = 0;
+        }
+      }
       const aiCount = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 60 * 60 * 1000).length;
       if (aiCount >= 5) prob *= 0.3;
-      if (idle >= idleThreshold && Math.random() < prob && !isConversationBusyV2(key, st)) {
+      if (idle >= idleThreshold && prob > 0 && Math.random() < prob && !isConversationBusyV2(key, st)) {
         void sendWakePromptV2(key, 'proactiveCheck').catch((error) => log(`[reserved2] proactive 唤醒异常 ${key}:`, error?.message ?? error));
       }
       scheduleProactiveCheckV2(key);

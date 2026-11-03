@@ -213,12 +213,12 @@ export function formatStickerList(entries, query = '', limit = 48) {
   };
 }
 
-export function buildStickerContext(entries, max = 20) {
+export function buildStickerContext(entries, max = 48) {
   const list = (Array.isArray(entries) ? entries : []).map(normalizeStickerEntry).filter(Boolean);
   if (!list.length) return '';
   const top = [...list]
     .sort((a, b) => ((b.desc || b.localNote) ? 1 : 0) - ((a.desc || a.localNote) ? 1 : 0) || (b.useCount || 0) - (a.useCount || 0))
-    .slice(0, Math.max(1, Math.min(30, Number(max) || 20)));
+    .slice(0, Math.max(1, Math.min(80, Number(max) || 48)));
   const lines = top.map((e) => {
     const shortId = e.md5 && e.md5.length >= 8 ? e.md5.slice(0, 8) : e.id;
     const label = e.localNote || e.desc || e.localName || '（未标注表情，可用 qq_get_sticker_image 看图）';

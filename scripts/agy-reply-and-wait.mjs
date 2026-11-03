@@ -184,6 +184,7 @@ async function main() {
       }
     }
 
+    let batchReply = null;
     if (opts.batch) {
       let items = [];
       // PowerShell 传给原生程序时会吞掉/错位 \" 转义，导致 JSON 截断。依次尝试：原样 → 去反斜杠转义 → 拼回被拆散的位置参数 → 正则抢救。
@@ -216,6 +217,7 @@ async function main() {
       if (Array.isArray(items)) {
         for (const item of items) {
           if (!item) continue;
+          if (!batchReply && item.reply) batchReply = String(item.reply);
           const msgs = Array.isArray(item.messages)
             ? item.messages
             : (item.text ? [String(item.text)] : []);
@@ -338,7 +340,7 @@ async function main() {
         ...(spec.asSticker === true ? { asSticker: true } : {}),
         ...(spec.note ? { note: String(spec.note) } : {}),
         ...(spec.tags ? { tags: spec.tags } : {}),
-        ...(spec.replyToMessageId || opts.reply ? { replyToMessageId: String(spec.replyToMessageId || opts.reply) } : {}),
+        ...(spec.replyToMessageId || opts.reply || batchReply ? { replyToMessageId: String(spec.replyToMessageId || opts.reply || batchReply) } : {}),
       };
       if (!drawBody.prompt) continue;
       try {

@@ -35,7 +35,8 @@ async function readAudio(response, maxBytes, provider) {
 // 两种提供商都返回 MP3。只在管理员配置的备用提供商上重试一次。
 export async function synthesizeSpeech(text, config, options, maxBytes, request = fetch) {
   const configured = String(config.provider || 'elevenlabs').toLowerCase();
-  const fallback = String(config.fallbackProvider ?? 'google').toLowerCase();
+  const rawFallback = String(config.fallbackProvider ?? 'google').toLowerCase();
+  const fallback = rawFallback === 'none' ? '' : rawFallback;
   const primary = String(options.provider || configured).toLowerCase();
   if (!['google', 'elevenlabs'].includes(primary) || ![configured, fallback].includes(primary)) {
     throw Object.assign(new Error('请求的 TTS 提供商未启用'), { statusCode: 400 });
@@ -55,19 +56,29 @@ export async function synthesizeSpeech(text, config, options, maxBytes, request 
         const model = String(options.modelId || cfg.modelId || 'eleven_v3');
         const url = new URL('https://api.elevenlabs.io/v1/text-to-speech/' + encodeURIComponent(voiceId));
         url.searchParams.set('output_format', cfg.outputFormat || 'mp3_44100_128');
-        const res = await request(url, {
-          method: 'POST', redirect: 'error', signal: AbortSignal.timeout(25000),
-          headers: { 'xi-api-key': key, 'content-type': 'application/json' },
-          body: JSON.stringify({
-            text, model_id: model,
-            voice_settings: {
-              stability: Number(cfg.stability ?? 0.5), similarity_boost: Number(cfg.similarityBoost ?? 0.75),
-              style: Number(cfg.style ?? 0.35), use_speaker_boost: true,
-            },
-            ...(cfg.languageCode && !model.includes('v3') ? { language_code: cfg.languageCode } : {}),
-          }),
-        });
-        return { audio: await readAudio(res, maxBytes, 'ElevenLabs'), provider: `elevenlabs(${voiceId}/${model})` };
+        const maxAttempts = request === fetch ? 2 : 1;
+        let lastErr = null;
+        for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+          try {
+            const res = await request(url, {
+              method: 'POST', redirect: 'error', signal: AbortSignal.timeout(25000),
+              headers: { 'xi-api-key': key, 'content-type': 'application/json' },
+              body: JSON.stringify({
+                text, model_id: model,
+                voice_settings: {
+                  stability: Number(cfg.stability ?? 0.5), similarity_boost: Number(cfg.similarityBoost ?? 0.75),
+                  style: Number(cfg.style ?? 0.35), use_speaker_boost: true,
+                },
+                ...(cfg.languageCode && !model.includes('v3') ? { language_code: cfg.languageCode } : {}),
+              }),
+            });
+            return { audio: await readAudio(res, maxBytes, 'ElevenLabs'), provider: `elevenlabs(${voiceId}/${model})` };
+          } catch (err) {
+            lastErr = err;
+            if (attempt < maxAttempts) await new Promise((r) => setTimeout(r, 600));
+          }
+        }
+        throw lastErr;
       }
       if (provider !== 'google') throw new Error('不支持的 TTS 提供商');
       if ([...text].length > 200) throw new Error('Google TTS 单次支持 200 字以内');
