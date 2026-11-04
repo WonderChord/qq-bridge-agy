@@ -118,22 +118,22 @@ if ($ForceRestartNapCat -or (-not $portsAlive)) {
     Stop-HeadlessNapCatOnly
   }
   Write-Host "[ensure-daemons] Starting headless NapCat ($BotQQ) via WMI (ShowWindow=0, NO_PROXY=*)..."
-  $napEnv = [Environment]::GetEnvironmentVariables()
-  $napEnv['NO_PROXY'] = '*'
-  $napEnv.Remove('HTTP_PROXY')
-  $napEnv.Remove('HTTPS_PROXY')
-  $napEnv['NAPCAT_QUICK_ACCOUNT'] = $BotQQ
-  if ($NapCfg.dataDir) { $napEnv['NAPCAT_DATA_DIR'] = [string]$NapCfg.dataDir }
-  if ($NapCfg.userDataDir) { $napEnv['NAPCAT_USER_DATA_DIR'] = [string]$NapCfg.userDataDir }
-  $napStart = New-CimInstance -ClassName Win32_ProcessStartup -Property @{
-    ShowWindow = [uint16]0
-    EnvironmentVariables = [string[]]@($napEnv.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" })
-  } -ClientOnly
-  $napCmd = '"{0}" {1}' -f $exe, $BotQQ
+  $envParts = @('set NO_PROXY=*', 'set HTTP_PROXY=', 'set HTTPS_PROXY=', "set NAPCAT_QUICK_ACCOUNT=$BotQQ")
+  if ($NapCfg.dataDir) {
+    $dataDirPath = [string]$NapCfg.dataDir
+    if (-not [IO.Path]::IsPathRooted($dataDirPath)) { $dataDirPath = Join-Path $BridgeDir $dataDirPath }
+    $envParts += "set NAPCAT_DATA_DIR=$dataDirPath"
+  }
+  if ($NapCfg.userDataDir) {
+    $userDataDirPath = [string]$NapCfg.userDataDir
+    if (-not [IO.Path]::IsPathRooted($userDataDirPath)) { $userDataDirPath = Join-Path $BridgeDir $userDataDirPath }
+    $envParts += "set NAPCAT_USER_DATA_DIR=$userDataDirPath"
+  }
+  $napCmd = 'cmd.exe /c "' + ($envParts -join '&& ') + '&& "' + $exe + '" ' + $BotQQ + '"'
   $r1 = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
     CommandLine = $napCmd
     CurrentDirectory = $NapCatDir
-    ProcessStartupInformation = $napStart
+    ProcessStartupInformation = $si
   }
   if ($r1.ReturnValue -ne 0) { throw "NapCat 启动失败，WMI 返回 $($r1.ReturnValue)" }
   Write-Host "[ensure-daemons] NapCat WMI launch ReturnValue=$($r1.ReturnValue) PID=$($r1.ProcessId)"
