@@ -11252,12 +11252,17 @@ async function main() {
     }
   }
 
-  // 发送引用时解析目标：支持真实 QQ message_id，也支持 recentMessages 里的 seq（自动映射到真实 messageId）。
+  // 发送引用时解析目标：支持真实 QQ message_id，也支持 recentMessages/unread 里的 seq 或 messageId（自动映射，即使 OneBot get_msg 暂不可用也能从当前会话缓存命中）。
   async function resolveReplyTargetV2(st, kind, convId, ref) {
     const refStr = String(ref ?? '').trim();
     if (!refStr) return null;
-    const found = Array.isArray(st?.recentMessages) ? st.recentMessages.find((m) => m && String(m.seq) === refStr) : null;
-    // 若 ref 命中本地 seq，且本地存有真实 messageId，优先按 seq 映射，避免与真实 id 冲突。
+    const pool = [
+      ...(Array.isArray(st?.recentMessages) ? st.recentMessages : []),
+      ...(Array.isArray(st?.unread) ? st.unread : []),
+    ];
+    const foundBySeq = pool.find((m) => m && String(m.seq) === refStr);
+    const foundByMsgId = pool.find((m) => m && m.messageId && String(m.messageId) === refStr);
+    const found = foundBySeq || foundByMsgId;
     if (found && found.messageId && String(found.messageId) !== refStr) {
       const realId = String(found.messageId);
       const realInfo = await resolveReplyInfo(kind, convId, realId);
@@ -11276,9 +11281,8 @@ async function main() {
     if (info) return { info, messageId: refStr };
     if (found && found.messageId) {
       const realId = String(found.messageId);
-      const realInfo = await resolveReplyInfo(kind, convId, realId);
       return {
-        info: realInfo || {
+        info: {
           sender: String(found.sender || ''),
           text: String(found.text || found.plain || '').slice(0, 200),
           userId: found.userId ?? null,
@@ -12099,13 +12103,15 @@ async function main() {
     const stickerCfg = cfg.socialV2?.sticker ?? {};
     if (stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false && stickerEntries.length > 0) {
       const stickerSlotKey = `${wid}::stickers`;
-      const maxS = stickerCfg.promptMaxStickers ?? 36;
-      const stickerSig = `${stickerEntries.length}:${maxS}:${stickerEntries.slice(0, maxS).map((s) => `${s.id}:${s.note || ''}`).join('|').length}`;
+      const maxS = stickerCfg.promptMaxStickers ?? 48;
+      const stickerSig = crypto.createHash('sha1').update(
+        stickerEntries.slice(0, maxS).map((s) => `${s.md5 || s.id}:${s.localNote || s.desc || ''}`).join('|')
+      ).digest('hex').slice(0, 16);
       if (agyLastStickerSig.get(stickerSlotKey) !== stickerSig) {
         const fullStickerCtx = buildStickerContext(stickerEntries, maxS);
         agyLastStickerSig.set(stickerSlotKey, stickerSig);
         if (fullStickerCtx) {
-          prefix += `【本线程表情夹清单（仅首轮或新增表情时下发一次，后续轮次直接复用短 ID）】\n${buildCompactStickerHint()}\n${fullStickerCtx}\n\n`;
+          prefix += `【本线程表情夹清单（旧历史短 ID 如 C76FD5B1 已作废，请严格只使用下方最新清单里的 8 位短 ID）】\n${buildCompactStickerHint()}\n${fullStickerCtx}\n\n`;
         }
       }
     }

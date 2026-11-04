@@ -241,8 +241,18 @@ async function main() {
             try {
               await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
             } catch (err) {
-              failed = true;
-              console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err?.message ?? err}`);
+              if (payload.replyToMessageId && String(err?.message ?? '').includes('无法解析被引用消息')) {
+                delete payload.replyToMessageId;
+                try {
+                  await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
+                } catch (err2) {
+                  failed = true;
+                  console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err2?.message ?? err2}`);
+                }
+              } else {
+                failed = true;
+                console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err?.message ?? err}`);
+              }
             }
           }
           if (item.sticker) {
@@ -293,8 +303,18 @@ async function main() {
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
       } catch (err) {
-        failed = true;
-        console.error(`[agy-reply-and-wait] 文本发送警告: ${err?.message ?? err}`);
+        if (payload.replyToMessageId && String(err?.message ?? '').includes('无法解析被引用消息')) {
+          delete payload.replyToMessageId;
+          try {
+            await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
+          } catch (err2) {
+            failed = true;
+            console.error(`[agy-reply-and-wait] 文本发送警告: ${err2?.message ?? err2}`);
+          }
+        } else {
+          failed = true;
+          console.error(`[agy-reply-and-wait] 文本发送警告: ${err?.message ?? err}`);
+        }
       }
     }
     if (opts.sticker) {
