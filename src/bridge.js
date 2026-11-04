@@ -12088,14 +12088,38 @@ async function main() {
       prefix += '【角色卡已清除】从本轮起使用默认身份。\n\n';
     }
     const comp = MEMORY_COMPARTMENTS[key];
-    if (comp && fs.existsSync(comp.summaryPath)) {
+    const isGroupKey = String(key).startsWith('group:');
+    const rawGroupCfg = personaCfg().memoryCompartments?.[String(key)];
+    const privComp = isGroupKey && rawGroupCfg?.includePrivate !== false
+      ? (MEMORY_COMPARTMENTS[`private:${cfg.ownerQQ}`]
+        || (() => {
+          const privKey = Object.keys(personaCfg().memoryCompartments || {}).find((k) => k.startsWith('private:'));
+          return privKey ? MEMORY_COMPARTMENTS[privKey] : undefined;
+        })())
+      : undefined;
+    const hasOwnMem = Boolean(comp && fs.existsSync(comp.summaryPath));
+    const hasPrivMem = Boolean(privComp && privComp.summaryPath !== comp?.summaryPath && fs.existsSync(privComp.summaryPath));
+    if (hasOwnMem || hasPrivMem) {
       try {
-        const memMtime = String(Math.floor(fs.statSync(comp.summaryPath).mtimeMs));
-        if (agyLastMemSig.get(slotKey) !== memMtime) {
-          const memText = fs.readFileSync(comp.summaryPath, 'utf8').trim().slice(0, 1600);
-          agyLastMemSig.set(slotKey, memMtime);
-          if (memText) {
-            prefix += `【本会话分舱长期记忆精华（仅限 ${key} 使用，严禁跨群串台）】\n${memText}\n\n`;
+        const ownMtime = hasOwnMem ? String(Math.floor(fs.statSync(comp.summaryPath).mtimeMs)) : '0';
+        const privMtime = hasPrivMem ? String(Math.floor(fs.statSync(privComp.summaryPath).mtimeMs)) : '0';
+        const combinedMemSig = `${ownMtime}:${privMtime}`;
+        if (agyLastMemSig.get(slotKey) !== combinedMemSig) {
+          agyLastMemSig.set(slotKey, combinedMemSig);
+          if (hasOwnMem) {
+            const memText = fs.readFileSync(comp.summaryPath, 'utf8').trim().slice(0, 1600);
+            if (memText) {
+              const title = isGroupKey
+                ? `【本群专属长期记忆精华（仅限 ${key} 使用，与其他群严格隔离）】`
+                : `【本会话分舱长期记忆精华（Creator 私聊记忆）】`;
+              prefix += `${title}\n${memText}\n\n`;
+            }
+          }
+          if (hasPrivMem) {
+            const privText = fs.readFileSync(privComp.summaryPath, 'utf8').trim().slice(0, 1600);
+            if (privText) {
+              prefix += `【单向挂载：Creator 私聊长期记忆（群内与 Creator 互动时共享默契背景，但私密细节勿向无关群友外泄）】\n${privText}\n\n`;
+            }
           }
         }
       } catch {}
