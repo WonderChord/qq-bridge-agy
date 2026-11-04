@@ -1538,7 +1538,10 @@ async function main() {
     const localFiles = scanLocalStickerDir();
     const localByMd5 = new Map(localFiles.map((f) => [f.md5, f]));
     const localByName = new Map(localFiles.map((f) => [f.name.toLowerCase(), f]));
-    const supersededMd5s = new Set(['2BA024A82EF4D5B70FFF2E10DDA895F7']);
+    const supersededMd5s = new Set([
+      '2BA024A82EF4D5B70FFF2E10DDA895F7',
+      '8FF1148B5AAAD0203137278443ECCBDD',
+    ]);
     for (const e of stickerEntries) {
       if (e?.localName && e?.md5) {
         const cur = localByName.get(String(e.localName).toLowerCase());
