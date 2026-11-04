@@ -12142,6 +12142,201 @@ async function main() {
     return prefix;
   }
 
+  const PRIVATE_RECALL_STOPWORDS = new Set([
+    '什么', '怎么', '为什么', '今天', '昨天', '刚才', '最近', '现在', '那个', '这个',
+    '一个', '一下', '不是', '没有', '可以', '就是', '还是', '觉得', '知道', '看到',
+    '听到', '出来', '进去', '哈哈', '真的', '其实', '而且', '不过', '如果', '因为',
+    '所以', '喜欢', '讨厌', '感觉', '自己', '我们', '你们', '他们', '主人', '墨宝',
+    '妮亚', '乃爱', '基米', '哈基米', '表情', '语音', '私聊', '抱抱', '亲亲', '睡觉',
+    '晚安', '早安', '干嘛', '在吗', '干活', '说话', '起来', '看看', '说说', '哪里',
+    '哪个', '多少', '时候', '已经', '一直', '突然', '到底', '居然', '竟然', '简直',
+  ]);
+
+  function recallGroupMemoryForPrivateV2(key, st) {
+    if (!String(key ?? '').startsWith('private:') || !st) return '';
+    const unreadNonSelf = (Array.isArray(st.unread) ? st.unread : []).filter((m) => m && !m.isSelf);
+    const recentNonSelf = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
+    const primaryMsgs = unreadNonSelf.length > 0 ? unreadNonSelf : recentNonSelf.slice(-1);
+    const primaryText = primaryMsgs.map((m) => String(m.plain || m.text || '')).join(' ').trim();
+    if (!primaryText) return '';
+    const contextText = [...recentNonSelf.slice(-2), ...unreadNonSelf]
+      .map((m) => String(m.plain || m.text || ''))
+      .join(' ')
+      .trim();
+    const isExplicitGroupQuery = /(?:群里|海沟|higo|群友|水群|那群人|那帮人|他们.*聊|都在聊|群.*聊|在群|群动态)/i.test(primaryText);
+    const qLower = primaryText.toLowerCase();
+    const ctxLower = contextText.toLowerCase();
+
+    const asciiIgnore = new Set(['nya', 'nia', 'creator', 'qq', 'ai', 'ok', 'bot', 'http', 'https', 'com', 'cn']);
+    const asciiTokens = [...new Set((qLower.match(/[a-z0-9]{2,}/g) || []).filter((t) => !asciiIgnore.has(t) && !/^\d{6,}$/.test(t)))];
+
+    const cjkRuns = primaryText.match(/[\u4e00-\u9fff]{2,}/g) || [];
+    const cjkBigrams = new Set();
+    const cjkTrigrams = new Set();
+    for (const run of cjkRuns) {
+      for (let i = 0; i <= run.length - 2; i += 1) {
+        const bg = run.slice(i, i + 2);
+        if (!PRIVATE_RECALL_STOPWORDS.has(bg) && !/[群里海沟]/.test(bg)) cjkBigrams.add(bg);
+      }
+      for (let i = 0; i <= run.length - 3; i += 1) {
+        const tg = run.slice(i, i + 3);
+        if (!PRIVATE_RECALL_STOPWORDS.has(tg)) cjkTrigrams.add(tg);
+      }
+    }
+
+    const groupKeys = Object.keys(personaCfg().memoryCompartments || {}).filter((k) => k.startsWith('group:'));
+    if (groupKeys.length === 0) return '';
+
+    const scoredLines = [];
+    const matchedLiveMsgs = [];
+    const seenLines = new Set();
+
+    for (const gKey of groupKeys) {
+      const gComp = MEMORY_COMPARTMENTS[gKey];
+      if (!gComp) continue;
+      const gDir = path.dirname(gComp.summaryPath);
+      const candidateFiles = [];
+      if (fs.existsSync(gComp.summaryPath)) {
+        candidateFiles.push({ file: gComp.summaryPath, tag: '常驻' });
+      }
+      const peopleDir = path.join(gDir, 'people');
+      if (fs.existsSync(peopleDir)) {
+        try {
+          for (const fn of fs.readdirSync(peopleDir).filter((f) => f.endsWith('.md')).slice(0, 10)) {
+            candidateFiles.push({ file: path.join(peopleDir, fn), tag: '人物' });
+          }
+        } catch {}
+      }
+      let newestDiaryBullets = [];
+      if (fs.existsSync(gComp.diaryDir)) {
+        try {
+          const diaryFiles = fs.readdirSync(gComp.diaryDir)
+            .filter((f) => f.endsWith('.md'))
+            .map((fn) => {
+              const full = path.join(gComp.diaryDir, fn);
+              let mtime = 0;
+              try { mtime = fs.statSync(full).mtimeMs; } catch {}
+              const isDailyConsolidated = /^\d{4}-\d{2}-\d{2}\.md$/.test(fn);
+              return { fn, full, mtime, isDailyConsolidated };
+            })
+            .sort((a, b) => (b.isDailyConsolidated - a.isDailyConsolidated) || (b.mtime - a.mtime) || b.fn.localeCompare(a.fn))
+            .slice(0, 6);
+          for (let idx = 0; idx < diaryFiles.length; idx += 1) {
+            const df = diaryFiles[idx];
+            const tag = df.fn.replace(/\.md$/, '');
+            candidateFiles.push({ file: df.full, tag, isNewestDiary: idx === 0 });
+          }
+        } catch {}
+      }
+
+      const knownEntities = new Set(['半瓶醋', 'Cyber马', 'Heavy rain', '莱德潘达', '糖醋小鸡排', 'Stannn', '千丝纸折鸢', 'stay with me', '隐痛', '夜吻', '偷得浮生半日闲', 'Usher808', '斫青客', '大矿工', '没头脑的鱼', '大白海豹', '朱抬头', '心不清', '发展者', 'AKnight', 'KeA', '鸭鸭']);
+
+      for (const cf of candidateFiles) {
+        let raw = '';
+        try { raw = fs.readFileSync(cf.file, 'utf8'); } catch { continue; }
+        const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('- ') || l.startsWith('* '));
+        if (cf.isNewestDiary && lines.length > 0) {
+          newestDiaryBullets = lines.slice(-3).map((l) => `[${cf.tag}] ${l.replace(/^[-*]\s*/, '')}`);
+        }
+        for (const line of lines) {
+          for (const m of line.matchAll(/`([^`]{2,20})`/g)) {
+            const ent = m[1].trim();
+            if (!/^(?:Creator|Nya|Nia|group:|private:|\d+)$/i.test(ent)) knownEntities.add(ent);
+          }
+          const lineLower = line.toLowerCase();
+          let score = 0;
+          for (const ent of knownEntities) {
+            const entLower = ent.toLowerCase();
+            if (entLower.length >= 2 && (qLower.includes(entLower) || ctxLower.includes(entLower))) {
+              if (lineLower.includes(entLower)) score += 6;
+            } else if (ent.length >= 3) {
+              const tail2 = ent.slice(-2).toLowerCase();
+              if (/[\u4e00-\u9fff]{2}/.test(tail2) && qLower.includes(tail2) && lineLower.includes(entLower)) {
+                score += 5;
+              }
+            }
+          }
+          for (const tok of asciiTokens) {
+            if (lineLower.includes(tok)) score += 4;
+          }
+          for (const tg of cjkTrigrams) {
+            if (line.includes(tg)) score += 4;
+          }
+          let bgHits = 0;
+          for (const bg of cjkBigrams) {
+            if (line.includes(bg)) bgHits += 1;
+          }
+          if (bgHits >= 2) {
+            score += bgHits * 3;
+          } else if (bgHits === 1 && (isExplicitGroupQuery || asciiTokens.length > 0)) {
+            score += 2;
+          }
+          if (score >= 4) {
+            const cleanLine = `[${cf.tag}] ${line.replace(/^[-*]\s*/, '').slice(0, 160)}`;
+            if (!seenLines.has(cleanLine)) {
+              seenLines.add(cleanLine);
+              scoredLines.push({ score, text: cleanLine });
+            }
+          }
+        }
+      }
+
+      const gState = socialV2.conversations.get(gKey);
+      const gRecent = Array.isArray(gState?.recentMessages) ? gState.recentMessages : [];
+      if (gRecent.length > 0) {
+        if (isExplicitGroupQuery) {
+          for (const m of gRecent.slice(-6)) {
+            if (!m) continue;
+            const txt = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
+            if (txt) matchedLiveMsgs.push(`[群近期 ${localClockText(m.time)}] ${m.sender || m.userId}: ${txt}`);
+          }
+        } else {
+          for (const m of gRecent.slice(-30)) {
+            if (!m) continue;
+            const txt = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim();
+            const sender = String(m.sender || '');
+            const combined = `${sender} ${txt}`.toLowerCase();
+            let msgScore = 0;
+            for (const ent of knownEntities) {
+              const entLower = ent.toLowerCase();
+              if (entLower.length >= 2 && qLower.includes(entLower) && combined.includes(entLower)) msgScore += 6;
+            }
+            for (const tok of asciiTokens) {
+              if (combined.includes(tok)) msgScore += 4;
+            }
+            for (const tg of cjkTrigrams) {
+              if (combined.includes(tg)) msgScore += 4;
+            }
+            let bgHits = 0;
+            for (const bg of cjkBigrams) {
+              if (combined.includes(bg)) bgHits += 1;
+            }
+            if (bgHits >= 2) msgScore += bgHits * 3;
+            if (msgScore >= 5) {
+              matchedLiveMsgs.push(`[群近期 ${localClockText(m.time)}] ${sender || m.userId}: ${txt.slice(0, 80)}`);
+            }
+          }
+        }
+      }
+
+      if (isExplicitGroupQuery && scoredLines.length === 0 && newestDiaryBullets.length > 0) {
+        for (const b of newestDiaryBullets) {
+          if (!seenLines.has(b)) {
+            seenLines.add(b);
+            scoredLines.push({ score: 3, text: b });
+          }
+        }
+      }
+    }
+
+    scoredLines.sort((a, b) => b.score - a.score);
+    const topBullets = scoredLines.slice(0, 5).map((x) => `- ${x.text}`);
+    const topLive = [...new Set(matchedLiveMsgs)].slice(-5).map((x) => `- ${x}`);
+    if (topBullets.length === 0 && topLive.length === 0) return '';
+    const combined = [...topBullets, ...topLive].join('\n').slice(0, 800);
+    return `\n【私聊按需巡回的群聊记忆与近期动态（仅当 Creator 问及或话题相关时按需回应，平时不主动硬扯）】\n${combined}`;
+  }
+
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const st = getSocialV2State(key);
@@ -12163,8 +12358,11 @@ async function main() {
       const voiceHint = hasVoiceReq && voiceCfg().enabled && v2ToolEnabled('sendVoice') && ttsEnabled()
         ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "要亲口说的短句台词" 发送真实 QQ 语音条（可单发 --tts 不带文字，或配文字一起发）！'
         : '';
+      const groupRecallHint = String(key ?? '').startsWith('private:')
+        ? recallGroupMemoryForPrivateV2(key, st)
+        : '';
       if (reason === 'replyCheck') {
-        return `【回复检查】${key}${drawHint}${voiceHint}\n仅明确顺着你追问才带 --reply <msgId> 简短回 1 条；否则直接 --no-reply 标已读。`;
+        return `【回复检查】${key}${drawHint}${voiceHint}${groupRecallHint}\n仅明确顺着你追问才带 --reply <msgId> 简短回 1 条；否则直接 --no-reply 标已读。`;
       }
       if (reason === 'proactiveCheck' || String(reason ?? '').startsWith('proactiveCheck:')) {
         const customHint = String(reason ?? '').includes(':') ? String(reason).slice(String(reason).indexOf(':') + 1).trim() : '';
@@ -12175,7 +12373,7 @@ async function main() {
         }
         return `【主动冒泡（群聊开话题）】${key} | 当前时间：${clockNow}${hintLine}\n群里已经安静了一阵子，这是你主动出来冒泡水群的机会（快照 messages 为空是正常的）！请结合当前时间点、recent 里刚才聊过的话茬或本群熟人老梗，像真人水群一样平地抛 1 句简短吐槽/闲聊或单甩一张应景 --sticker（平地主动开话题不要带 --reply；若实在觉得不适合开口也可 --no-reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
       }
-      return `【唤醒】${key} | 原因：${reason}${triggeredLine}${drawHint}${voiceHint}\n只处理快照 messages 新消息（群聊必带 --reply <msgId>；路过/无需插嘴直接 --no-reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
+      return `【唤醒】${key} | 原因：${reason}${triggeredLine}${drawHint}${voiceHint}${groupRecallHint}\n只处理快照 messages 新消息（群聊必带 --reply <msgId>；路过/无需插嘴直接 --no-reply），调 1 次 agy-reply-and-wait.mjs 后立即结束回合。`;
     }
 
     const roleLine = roleState.role ? `【当前角色】${roleState.role}（完整角色卡请调用 qq_get_prompt 查看）\n\n` : '';
