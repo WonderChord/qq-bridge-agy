@@ -8,6 +8,13 @@ import crypto from 'node:crypto';
 import vm from 'node:vm';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { recoverNapcatLogin, loginAttemptFile } from '../src/napcat-login.js';
+import { napcatLoginConfig } from '../src/napcat-config.js';
+import { createTurnClaims } from '../src/agy-turn-claims.js';
+import { createMemoryCompartments } from '../src/memory-compartment.js';
+import { createArchiveChannel, createFlashJudge } from '../src/agy-coordinator.js';
+import { handleAgyRequest } from '../src/agy-routes.js';
+import { readConsolePage, consoleLoginPage } from '../src/webui-page.js';
 import * as markdown from '../src/md-to-plain.js';
 import * as sensitive from '../src/sensitive.js';
 import * as wait from '../src/v2-wait.js';
@@ -22,7 +29,7 @@ import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
-import { unwrap, createTurnCollector } from '../src/dsh-client.js';
+import { AgyApiClient, unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {} } = {}) {
@@ -147,7 +154,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2, resolveReplyTargetV2,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,
@@ -175,7 +182,9 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   const timers = new Set();
   const context = vm.createContext({
     fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
-    fetch: fakeFetch,
+    recoverNapcatLogin, loginAttemptFile, napcatLoginConfig,
+    createTurnClaims, createMemoryCompartments, createArchiveChannel, createFlashJudge, handleAgyRequest,
+    readConsolePage, consoleLoginPage, fetch: fakeFetch,
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
     execFileSync: () => '',
@@ -184,7 +193,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     process: { pid: process.pid, platform: process.platform, kill: process.kill, env: {}, exit: (code) => { throw new Error('unexpected exit ' + code); } },
     setTimeout: (fn, ms) => { const timer = setTimeout(fn, ms); timers.add(timer); return timer; },
     clearTimeout, setInterval: () => ({ unref() {} }), clearInterval: () => {},
-    NodeApiClient: class { constructor() { return api; } },
+    NodeApiClient: class {
+      constructor(baseUrl) {
+        return String(baseUrl).startsWith('agy://')
+          ? new AgyApiClient(baseUrl, path.join(temp, 'state/agy-worker-turns.json')) : api;
+      }
+    },
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,

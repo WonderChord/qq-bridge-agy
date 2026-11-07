@@ -74,3 +74,4 @@ memory/*
 stickers/*
 !stickers/README.md
 assets/self*.png
+bin/*.exe

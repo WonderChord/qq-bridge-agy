@@ -34,6 +34,7 @@ async function main() {
         console.log(`JobId       : ${j.id}`);
         console.log(`会话 Key    : ${j.key}`);
         console.log(`目标摘要文件: ${j.summaryPath}`);
+        if (j.peoplePath) console.log(`群友百字档案: ${j.peoplePath}`);
         console.log(`目标日记目录: ${j.diaryDir}`);
         console.log(`消息范围    : seq ${j.fromSeq} ~ ${j.toSeq}（共 ${j.messages.length} 条）`);
         console.log(`-------------------`);
@@ -41,7 +42,17 @@ async function main() {
           console.log(`[${m.at || ''}] ${m.sender}(${m.userId}): ${m.text}`);
         }
         console.log(`-------------------`);
-        console.log(`请提炼本批次有价值的长期记忆（新梗、常驻群友性格/立场、未完话题；严禁记录起哄开盒外号或跨群信息），更新 ${j.summaryPath}（保持精炼 <= 1200 字，改写合并旧条目而非无限追加）并按需追加简明日记到 ${j.diaryDir}，完成后执行：`);
+        const isPriv = String(j.key || '').startsWith('private:');
+        if (isPriv) {
+          console.log(`【私聊与 Creator 高保真详尽归档指令】请甄别本批次信息：单次无特殊意义的随口流水账直接 SKIP；凡涉及 Creator（墨宝）的身心健康与病症/用药（如玉米症/抑郁症 28 天处方续方周期、浅睡易醒、鬼压床、食欲状态）、情绪倾诉、亲密/爱爱具体偏好与边界约定（如对坐慢磨、紧抱不拍臀、主动骑乘、爱爱时少发图片表情包、平时克制（）与❤）、项目企划（乃爱 Noa 是正主本人）及重要约定，请详尽提炼进 ${j.summaryPath}（<= 4500 字）并追加到 ${j.diaryDir}。完成后执行：`);
+        } else {
+          const peopleFile = j.peoplePath || j.summaryPath.replace(/summary\.md$/i, 'people.md');
+          console.log(`【群聊主模型双层归档与重要性过滤指令】
+1) 严格区分「重要记忆」与「聊完即 SKIP 的话题」：某人今天独自吃了什么饭/喝了什么饮料（如生椰拿铁、气泡水、5元拉面）、随手转的新闻或一次性水群，聊完直接 SKIP，严禁写入长期设定！但「谁和谁约好一起吃什么/去哪玩」、「哪几个人一起去吃了什么/面基/联机」、「立下的请客欠账 Flag（如发展者欠全群厚切炸猪排）」、「群友间借号/交易/互助」以及「持久的硬件/座驾/乐器/相机装备与核心立场」必须完整记录！
+2) 维护日常全量常驻文件 ${j.summaryPath}（<= 7500 字：含群总纲、Creator画像及每位常驻群友约 100 字的日常设定）；
+3) 同步维护视情况巡回的深度详档 ${peopleFile}（每位常驻群友 200~350 字，含详细装备拓扑、人际交集约定与历史名场面，合入新重要事件时严禁删丢原有核心装备与设定！）；
+4) 仅将有长期价值的事件写入 ${j.diaryDir}。完成后执行：`);
+        }
         console.log(`node "${path.join(ROOT, 'scripts')}\\agy-wait-archive.mjs" --done-id "${j.id}"`);
         process.exit(0);
       }

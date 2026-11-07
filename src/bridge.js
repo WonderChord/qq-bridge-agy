@@ -5,6 +5,11 @@
 //   DSH agent 回复/提问/审批 → events.mux 事件流 → 本进程 → send_msg → QQ
 //
 // 用法：node src/bridge.js （先编辑 ../config.json）
+import { createTurnClaims } from './agy-turn-claims.js';
+import { createMemoryCompartments } from './memory-compartment.js';
+import { createArchiveChannel, createFlashJudge } from './agy-coordinator.js';
+import { handleAgyRequest } from './agy-routes.js';
+import { readConsolePage, consoleLoginPage } from './webui-page.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import http from 'node:http';
@@ -56,6 +61,7 @@ import {
   markStickerUsed
 } from './sticker-lib.js';
 import { synthesizeSpeech } from './tts.js';
+import { recoverNapcatLogin, loginAttemptFile } from './napcat-login.js';
 import { napcatLoginConfig } from './napcat-config.js';
 import { runCodexDraw } from '../scripts/agy-codex-draw.mjs';
 
@@ -1417,6 +1423,13 @@ async function main() {
   // 库文件损坏/读不动时**不能当成空库继续**：下面任何一次 saveStickerStoreSafe 都会把
   // 「空库」写回去，把 AI 学到的 localNote/tags/usage 永久清零。读失败就显式降级为
   // 「只读不写」，并留下醒目日志（与 loadSlang 的 slangStoreWritable 同一套路）。
+  const supersededFile = path.join(STATE_DIR, 'superseded-sticker-md5s.json');
+  const savedMd5s = readJsonSafe(supersededFile, []);
+  const supersededMd5s = new Set([
+    ...(Array.isArray(savedMd5s) ? savedMd5s.filter((id) => /^[A-F0-9]{32}$/.test(id)) : []),
+    '2BA024A82EF4D5B70FFF2E10DDA895F7',
+    '8FF1148B5AAAD0203137278443ECCBDD',
+  ]);
   let stickerEntries = [];
   let stickerStoreWritable = true;
   try {
@@ -1538,10 +1551,7 @@ async function main() {
     const localFiles = scanLocalStickerDir();
     const localByMd5 = new Map(localFiles.map((f) => [f.md5, f]));
     const localByName = new Map(localFiles.map((f) => [f.name.toLowerCase(), f]));
-    const supersededMd5s = new Set([
-      '2BA024A82EF4D5B70FFF2E10DDA895F7',
-      '8FF1148B5AAAD0203137278443ECCBDD',
-    ]);
+    const prevSupersededCount = supersededMd5s.size;
     for (const e of stickerEntries) {
       if (e?.localName && e?.md5) {
         const cur = localByName.get(String(e.localName).toLowerCase());
@@ -1550,7 +1560,9 @@ async function main() {
         }
       }
     }
-    stickerEntries = stickerEntries.filter((e) => !supersededMd5s.has(String(e?.md5 || '').toUpperCase()));
+    if (supersededMd5s.size !== prevSupersededCount) atomicWriteJson(supersededFile, [...supersededMd5s]);
+    const obsolete = (md5) => supersededMd5s.has(md5) && !localByMd5.has(md5);
+    stickerEntries = stickerEntries.filter((e) => !obsolete(String(e?.md5 || '').toUpperCase()));
     const ensureLocalFilesRegistered = () => {
       const mergedMd5 = new Set(stickerEntries.map((e) => e.md5).filter(Boolean));
       let added = 0;
@@ -1611,10 +1623,10 @@ async function main() {
             const md5Match = url.match(/([0-9a-fA-F]{32})/);
             const cleanUrl = url.split('?')[0];
             const md5 = (md5Match ? md5Match[1] : crypto.createHash('md5').update(cleanUrl).digest('hex')).toUpperCase();
-            return { emoji_id: md5, resId: md5, url, md5, desc: '' };
+            return obsolete(md5) ? null : { emoji_id: md5, resId: md5, url, md5, desc: '' };
           }
           const md5 = String(item?.md5 || '').trim().toUpperCase();
-          if (md5 && supersededMd5s.has(md5)) return null;
+          if (obsolete(md5)) return null;
           const lf = md5 ? localByMd5.get(md5) : null;
           return lf ? { ...item, md5, localPath: lf.fullPath, localName: lf.name } : item;
         }).filter(Boolean);
@@ -1732,9 +1744,17 @@ async function main() {
 
   function consoleSocialV2Config() {
     const config = cfg.socialV2;
-    if (!config.tts?.elevenlabs) return config;
-    const { apiKey, ...elevenlabs } = config.tts.elevenlabs;
-    return { ...config, tts: { ...config.tts, elevenlabs } };
+    if (!config.tts) return config;
+    const tts = { ...config.tts };
+    if (tts.elevenlabs) {
+      const { apiKey, ...elevenlabs } = tts.elevenlabs;
+      tts.elevenlabs = elevenlabs;
+    }
+    if (tts.fish) {
+      const { apiKey, ...fish } = tts.fish;
+      tts.fish = fish;
+    }
+    return { ...config, tts };
   }
 
   function voiceLibrary() {
@@ -2040,12 +2060,16 @@ async function main() {
    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
    * 返回 { messageId, detail, verified, readback }。
    */
-  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, prepare, guard = captureSendGuard(key) } = {}) {
+  async function sendVoiceForV2(key, voiceRef, { label = '', verify = null, readback = false, audio = null, prepare, turn, guard = captureSendGuard(key) } = {}) {
     const vc = voiceCfg();
     if (!vc.enabled) throw new Error('语音功能已关闭（socialV2.voice.enabled=false）');
     // 音量参数校验前置（AI 传错时给出可读错误，而不是让 ffmpeg 报奇怪的错）
     if (audio) resolveAudioProcessing({ volume: audio.volume ?? vc.defaultVolume, normalize: audio.normalize === true, loudness: audio.loudness ?? vc.loudness });
     voiceBudgetCheck(key, vc);
+    const actionSig = 'voice:' + (label || voiceRef);
+    const duplicate = checkTurnActionV2(key, turn, actionSig);
+    if (duplicate) throw Object.assign(new Error(duplicate), { statusCode: 409 });
+    claims.recordTurnAction(key, turn, actionSig);
     voiceSendsPending.set(key, (voiceSendsPending.get(key) || 0) + 1);
     let resolved, sent;
     try {
@@ -3345,9 +3369,15 @@ async function main() {
   };
 
   /** 记录一次"上游还活着"的证据。任何来自 SnowLuma 的事件包都算（含心跳）。 */
+  let lastNonMetaEventAt = Date.now();
   function noteUpstreamPacket(kind) {
-    snowlumaHealth.lastPacketAt = Date.now();
+    const now = Date.now();
+    snowlumaHealth.lastPacketAt = now;
     snowlumaHealth.lastPacketKind = String(kind ?? '');
+    if (kind && !String(kind).startsWith('meta_event')) {
+      lastNonMetaEventAt = now;
+      napcatKernelProbeFailCount = 0;
+    }
   }
 
   /** 记下一次接收链路健康度。@param good - boolean；非布尔值忽略。 */
@@ -3442,6 +3472,7 @@ async function main() {
         signal: AbortSignal.timeout(8000),
       });
       const body = await res.json().catch(() => ({}));
+      if (res.status === 401 || res.status === 403 || res.status === 404) return null;
       return Boolean(res.ok && body.status === 'ok' && body.retcode === 0);
     } catch {
       return false;
@@ -3466,6 +3497,11 @@ async function main() {
       } else {
         noteReceiveHealth(body.data?.good, 'get_status');
         if (typeof body.data?.online === 'boolean') snowlumaHealth.accountOnline = body.data.online;
+        if (body.data?.online && !cfg.snowluma?.homeDir
+            && (lastNapcatLoginAction === 'need_qrcode' || (cfg.napcat?.account
+              && fs.existsSync(loginAttemptFile(ROOT, String(cfg.napcat.account)))))) {
+          void triggerNapcatAutoRelogin('confirm_online');
+        }
       }
     } catch (error) {
       snowlumaHealth.goodError = error?.message ?? String(error);
@@ -3473,20 +3509,24 @@ async function main() {
     snowlumaHealth.goodCheckedAt = Date.now();
     reportSnowlumaHealth();
 
-    // 每 4 分钟做一次带 no_cache: true 的底层 NTQQ 内核真活性探针，专门抓 get_status 假阳性假死
-    if (!cfg.snowluma?.homeDir && Date.now() - lastNapcatKernelProbeAt >= 4 * 60_000) {
+    // 仅当距最近一条真实业务事件超过 15 分钟且满 8 分钟探测周期时，才做带 no_cache: true 的底层内核探针；
+    // 且必须连续 2 个探测周期（共 4 次 RPC）均超时才判定为 MSF 断流假死，杜绝偶发抖动误杀在线进程。
+    const realQuietMs = Date.now() - lastNonMetaEventAt;
+    if (!cfg.snowluma?.homeDir && realQuietMs >= 15 * 60_000 && Date.now() - lastNapcatKernelProbeAt >= 8 * 60_000) {
       lastNapcatKernelProbeAt = Date.now();
       let kernelOk = await probeNapcatKernelAlive();
-      if (!kernelOk) {
+      if (kernelOk === false) {
         await new Promise((r) => setTimeout(r, 4000));
         kernelOk = await probeNapcatKernelAlive();
       }
-      if (!kernelOk) {
+      if (kernelOk === false) {
         napcatKernelProbeFailCount += 1;
-        noteReceiveHealth(false, 'kernel_probe_timeout');
-        snowlumaHealth.goodError = 'NTQQ kernel get_stranger_info(no_cache) timeout';
-        reportSnowlumaHealth();
-        void triggerNapcatAutoRelogin('kernel_zombie_timeout', { kernelDead: true });
+        if (napcatKernelProbeFailCount >= 2) {
+          noteReceiveHealth(false, 'kernel_probe_timeout');
+          snowlumaHealth.goodError = 'NTQQ kernel get_stranger_info(no_cache) timeout';
+          reportSnowlumaHealth();
+          void triggerNapcatAutoRelogin('kernel_zombie_timeout', { kernelDead: true });
+        }
       } else {
         napcatKernelProbeFailCount = 0;
       }
@@ -3497,25 +3537,19 @@ async function main() {
   let lastNapcatAutoReloginAt = 0;
   let lastNapcatForceRestartAt = 0;
 
-  function runForceRestartNapCatScript() {
+  function ensureNapcatProcess(force) {
     const psScript = path.join(ROOT, 'scripts', 'ensure-daemons.ps1');
     return new Promise((resolve) => {
       execFile(
         'powershell.exe',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psScript, '-ForceRestartNapCat'],
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', psScript, ...(force ? ['-ForceRestartNapCat'] : [])],
         { timeout: 65_000, windowsHide: true },
-        (err, stdout, stderr) => {
-          resolve({
-            ok: !err,
-            stdout: String(stdout || '').trim(),
-            stderr: String(stderr || '').trim(),
-            error: err?.message || '',
-          });
-        }
+        (err) => resolve({ ok: !err })
       );
     });
   }
 
+  let lastNapcatLoginAction = '';
   async function triggerNapcatAutoRelogin(reason = 'unknown', { kernelDead = false } = {}) {
     if (cfg.snowluma?.homeDir) return;
     const now = Date.now();
@@ -3526,69 +3560,33 @@ async function main() {
     lastNapcatAutoReloginAt = now;
     try {
       const auth = napcatLoginConfig(ROOT, cfg.napcat);
-      const { webuiUrl, webuiToken } = auth;
-      const hash = crypto.createHash('sha256').update(`${webuiToken}.napcat`).digest('hex');
-      const response = await fetch(`${webuiUrl}/api/auth/login`, {
-        method: 'POST', redirect: 'error',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ hash }),
-        signal: AbortSignal.timeout(8000),
-      }).catch(() => null);
-      const loginRes = await response?.json().catch(() => null);
-      const cred = loginRes?.data?.Credential;
-      if (response && !cred) {
-        log(`[NapCat自愈] WebUI 已响应，鉴权失败（HTTP ${response.status}），请检查 webuiConfigPath / token`);
-        return;
-      }
-
-      // 情况 A：连 WebUI (6099) 都连不上，或确认是 NTQQ 内核假死（WebUI 仍假报 isLogin=true 但内核 no_cache 探针连续超时）
-      if (!cred) {
-        if (now - lastNapcatForceRestartAt >= 8 * 60_000) {
-          lastNapcatForceRestartAt = now;
-          log(`🔄 [NapCat自愈] WebUI 不可达 (${reason})，正在调用 ensure-daemons.ps1 -ForceRestartNapCat 重启无头 NapCat...`);
-          const rs = await runForceRestartNapCatScript();
-          log(`🔄 [NapCat自愈] 进程重启结果 ok=${rs.ok}: ${rs.stdout.replace(/\r?\n/g, ' | ')}`);
+      const result = await recoverNapcatLogin(ROOT, auth);
+      if (result.action !== lastNapcatLoginAction) {
+        let portalHint = '';
+        if (result.action === 'need_qrcode') {
+          try {
+            const qp = JSON.parse(fs.readFileSync(path.join(STATE_DIR, 'qr-portal.json'), 'utf8'));
+            if (qp?.portalUrl) portalHint = `（公网扫码：${qp.portalUrl} ）`;
+          } catch {}
         }
-        return;
+        log('[NapCat自愈] ' + reason + ' -> ' + result.action
+          + (result.action === 'need_qrcode' ? '，请在本机扫码：' + result.webuiUrl + portalHint : ''));
+        lastNapcatLoginAction = result.action;
       }
-
-      const postApi = (ep, body = {}) => fetch(`${webuiUrl}${ep}`, {
-        method: 'POST', redirect: 'error',
-        headers: { 'content-type': 'application/json', authorization: `Bearer ${cred}` },
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15000),
-      }).then((r) => r.json()).catch(() => null);
-      const stRes = await postApi('/api/QQLogin/CheckLoginStatus');
-      const st = stRes?.data || {};
-
-      if (st.isLogin && !st.isOffline) {
-        if (!kernelDead) return;
-        // 典型假死：WebUI 缓存仍显示 isLogin=true，但底层 NTQQ C++ 内核已断流超时
-        if (now - lastNapcatForceRestartAt < 8 * 60_000) return;
+      if (kernelDead && result.action === 'already_online' && now - lastNapcatForceRestartAt >= 8 * 60_000) {
         lastNapcatForceRestartAt = now;
-        log(`🔄 [NapCat自愈] 检测到假死状态 (${reason}: WebUI 显示在线但 NTQQ 内核探针连续超时)，正在强制重启无头 NapCat 进程...`);
-        const rs = await runForceRestartNapCatScript();
-        log(`✅ [NapCat自愈] 假死重启执行完毕 (ok=${rs.ok}): ${rs.stdout.replace(/\r?\n/g, ' | ')}`);
-        return;
+        const rs = await ensureNapcatProcess(true);
+        log('[NapCat自愈] WebUI 在线但内核探针连续超时，重启结果 ok=' + rs.ok);
       }
-
-      log(`🔄 [NapCat自愈] 检测到离线 (${reason}, phase=${st.loginPhase || 'unknown'})，等待 9 秒让 NapCat Worker 完成重启并尝试免密 QuickLogin (${auth.uin})...`);
-      await new Promise((r) => setTimeout(r, 9000));
-      const st2 = (await postApi('/api/QQLogin/CheckLoginStatus'))?.data || {};
-      if (st2.isLogin && !st2.isOffline) {
-        log(`✅ [NapCat自愈] NapCat Worker 重启后已完成免密重连 (${auth.uin})`);
-        return;
-      }
-      const qRes = await postApi('/api/QQLogin/SetQuickLogin', { uin: auth.uin });
-      if (qRes?.code === 0 || String(qRes?.message || '').includes('QQ Is Logined')) {
-        log(`✅ [NapCat自愈] 快速登录 (QuickLogin) 成功: ${auth.uin}`);
-        return;
-      }
-      lastNapcatAutoReloginAt = Date.now() + 15 * 60 * 1000;
-      await postApi('/api/QQLogin/RefreshQRcode').catch(() => null);
-      log(`⚠️ [NapCat自愈] 快速登录票据已失效 (${qRes?.message || 'fail'})，已刷新二维码等待扫码（不再回退明文密码登录以免触发腾讯滑块拦截）`);
     } catch (err) {
-      log(`❌ [NapCat自愈] 异常: ${err?.message ?? err}`);
+      // Worker 在踢线后也会短暂重启。只在进程确实缺席时由守护脚本拉起它。
+      if (err.cause?.code === 'ECONNREFUSED' && now - lastNapcatForceRestartAt >= 8 * 60_000) {
+        lastNapcatForceRestartAt = now;
+        const rs = await ensureNapcatProcess(false);
+        log('[NapCat自愈] WebUI 未监听，守护检查结果 ok=' + rs.ok);
+      } else {
+        log('[NapCat自愈] ' + (err.message || err));
+      }
     } finally {
       napcatAutoReloginInFlight = false;
     }
@@ -3643,304 +3641,22 @@ async function main() {
   };
   let codexDrawInFlight = 0;
   const codexDrawTimes = [];
-  let ambiguousJudgeCounter = 0;
-  const ambiguousJudgeQueue = [];
-  const ambiguousJudgeInFlight = new Map();
-  const ambiguousJudgeWaiters = new Set();
-  const ambiguousJudgeCooldown = new Map();
-  let lastJudgePollAt = 0;
-
-  function isFlashJudgeOnlineV2() {
-    return ambiguousJudgeWaiters.size > 0 || (lastJudgePollAt > 0 && Date.now() - lastJudgePollAt < 75000);
-  }
-
-  function cancelFlashReplyJudgeV2(key, st) {
-    if (st?.pendingFlashJudgeTimer) {
-      clearTimeout(st.pendingFlashJudgeTimer);
-      st.pendingFlashJudgeTimer = null;
-    }
-    if (st) {
-      st.pendingFlashJudgeReason = null;
-      st.pendingFlashJudgeTargetText = '';
-    }
-    for (let i = ambiguousJudgeQueue.length - 1; i >= 0; i -= 1) {
-      if (ambiguousJudgeQueue[i]?.key === key) ambiguousJudgeQueue.splice(i, 1);
-    }
-    for (const [id, item] of ambiguousJudgeInFlight.entries()) {
-      if (item?.key === key) ambiguousJudgeInFlight.delete(id);
-    }
-  }
-
-  function pruneAmbiguousJudge() {
-    const now = Date.now();
-    while (ambiguousJudgeQueue.length > 0 && now - ambiguousJudgeQueue[0].createdAtMs > 25000) {
-      ambiguousJudgeQueue.shift();
-    }
-    for (const [id, item] of ambiguousJudgeInFlight.entries()) {
-      if (now - item.createdAtMs > 45000) ambiguousJudgeInFlight.delete(id);
-    }
-  }
-
-  function applyAmbiguousJudgeDecision(decideId, shouldWake) {
-    if (!decideId) return null;
-    const item = ambiguousJudgeInFlight.get(decideId);
-    ambiguousJudgeInFlight.delete(decideId);
-    if (!item) return { found: false };
-    if (shouldWake && Date.now() - item.createdAtMs <= 45000) {
-      log(`[reserved2] Flash 预筛通过 ${item.key} (${decideId}, reason=${item.reason || 'probability'}) -> 唤醒主力回复`);
-      scheduleWakeV2(item.key, `${item.reason || 'probability'}:Flash预筛可回`, { immediate: true });
-      return { found: true, woke: true, key: item.key };
-    }
-    try {
-      const st = getSocialV2State(item.key);
-      if (
-        st
-        && !st.pendingWakeTimer
-        && !st.pendingFlashJudgeTimer
-        && !isConversationBusyV2(item.key, st)
-        && !(Array.isArray(st.pendingWakeReasons) && st.pendingWakeReasons.length > 0)
-      ) {
-        const safeSeq = Math.min(Number(item.seq) || 0, Number(st.lastUnreadSeq) || 0);
-        if (safeSeq > (st.lastReadThroughSeq || 0)) {
-          acknowledgeMessagesV2(st, safeSeq);
-          saveSocialV2State();
-        }
-      }
-    } catch {}
-    log(`[reserved2] Flash 预筛拦截 ${item.key} (${decideId}, seq<=${item.seq || 0}) -> 静默标已读继续潜水`);
-    return { found: true, woke: false, key: item.key };
-  }
-
-  function enqueueAmbiguousJudgeV2(key, st, plainContent, { reason = 'probability' } = {}) {
-    if (!api.isAgyBackend) return;
-    if (st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-    pruneAmbiguousJudge();
-    const now = Date.now();
-    const baseReason = String(reason || 'probability').split(':')[0];
-    const isCallMention = baseReason === 'nameMention' || baseReason === 'keyword' || baseReason === 'ambiguousCall';
-    const lastAt = ambiguousJudgeCooldown.get(key) || 0;
-    if (!isCallMention && now - lastAt < 2500) return;
-    ambiguousJudgeCooldown.set(key, now);
-    const recentSlice = (Array.isArray(st.recentMessages) ? st.recentMessages.slice(-14) : []).map((m) => {
-      const uid = String(m.userId ?? '');
-      const ownerTag = CREATOR_UIDS.has(uid) ? `[${personaCreatorLabel()}]` : '';
-      const clock = m.time ? `[${localClockText(m.time)}] ` : '';
-      return {
-        sender: m.isSelf ? `${clock}${personaBotName()}(我)` : `${clock}${ownerTag}${String(m.sender || uid || '群友')}`,
-        text: String(m.text || m.plain || '').slice(0, 150),
-      };
-    });
-    const lastEntry = recentSlice[recentSlice.length - 1];
-    const latestPlain = String(plainContent ?? lastEntry?.text ?? '').slice(0, 180);
-    const ruleHint = isCallMention
-      ? `[名字/关键词(${reason})预筛：结合最近14条上下文判断群友是否在叫${personaBotName()}搭话、讨论它或接它话茬(yes，若[${personaCreatorLabel()}]喊必判yes)；同名梗或与${personaBotName()}无关的闲聊判no]`
-      : `[潜水概率抽样预筛：结合最近14条上下文判断是否有明确槽点/热梗/话题适合${personaBotName()}自然插一句(yes)；单字/纯表情包连刷/残句/严肃私事插不上嘴判no]`;
-    const item = {
-      id: `judge-${++ambiguousJudgeCounter}`,
-      key,
-      reason,
-      isCallMention,
-      seq: st.lastUnreadSeq || 0,
-      sender: lastEntry ? lastEntry.sender : '群友',
-      targetText: `${ruleHint} ${latestPlain}`,
-      rawTargetText: latestPlain,
-      recent: recentSlice,
-      createdAt: new Date(now).toISOString(),
-      createdAtMs: now,
-    };
-    for (const waiter of ambiguousJudgeWaiters) {
-      ambiguousJudgeWaiters.delete(waiter);
-      ambiguousJudgeInFlight.set(item.id, item);
-      waiter({ timedOut: false, item });
-      log(`[reserved2] 投递潜水回复预筛给 Flash ${key} (${item.id}, reason=${reason}, ctx=${recentSlice.length}, seq=${item.seq})`);
-      return;
-    }
-    if (ambiguousJudgeQueue.length >= 10) ambiguousJudgeQueue.shift();
-    ambiguousJudgeQueue.push(item);
-    log(`[reserved2] 潜水回复预筛入队等待 Flash ${key} (${item.id}, reason=${reason}, ctx=${recentSlice.length}, seq=${item.seq})`);
-  }
-
-  function flashJudgePriorityV2(reason) {
-    const base = String(reason || '').split(':')[0];
-    if (base === 'nameMention') return 30;
-    if (base === 'keyword') return 25;
-    if (base === 'ambiguousCall') return 20;
-    return 10;
-  }
-
-  function scheduleFlashReplyJudgeV2(key, st, reason = 'probability', triggerText = '') {
-    if (!api?.isAgyBackend || !st) return;
-    if (st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-    if (st.pendingFlashJudgeTimer) {
-      if (flashJudgePriorityV2(reason) > flashJudgePriorityV2(st.pendingFlashJudgeReason)) {
-        st.pendingFlashJudgeReason = reason;
-        if (triggerText) st.pendingFlashJudgeTargetText = String(triggerText);
-      }
-      return;
-    }
-    st.pendingFlashJudgeReason = reason;
-    st.pendingFlashJudgeTargetText = triggerText ? String(triggerText) : '';
-    const batchMs = Math.max(400, Number(st.wakeConfig?.batchWindowMs) || 2000);
-    st.pendingFlashJudgeTimer = setTimeout(() => {
-      st.pendingFlashJudgeTimer = null;
-      const finalReason = st.pendingFlashJudgeReason || reason;
-      const savedText = st.pendingFlashJudgeTargetText || '';
-      st.pendingFlashJudgeReason = null;
-      st.pendingFlashJudgeTargetText = '';
-      if (socialV2.paused || st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-      if (!isFlashJudgeOnlineV2()) {
-        log(`[reserved2] Flash 预筛线程未在线，降级直通唤醒 ${key} (${finalReason})`);
-        scheduleWakeV2(key, finalReason, { immediate: true });
-        return;
-      }
-      const newestHuman = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
-      enqueueAmbiguousJudgeV2(key, st, savedText || newestHuman?.plain || newestHuman?.text || '', { reason: finalReason });
-    }, batchMs);
-    st.pendingFlashJudgeTimer.unref?.();
-    log(`[reserved2] 计划 Flash 潜水预筛 ${key} (${reason})，${(batchMs / 1000).toFixed(1)}s 合批后判定`);
-  }
-
-  function waitNextAmbiguousJudge({ timeoutMs = 55000, onAbortRegistrar } = {}) {
-    pruneAmbiguousJudge();
-    if (ambiguousJudgeQueue.length > 0) {
-      const item = ambiguousJudgeQueue.shift();
-      ambiguousJudgeInFlight.set(item.id, item);
-      return Promise.resolve({ timedOut: false, item });
-    }
-    return new Promise((resolve) => {
-      let settled = false;
-      const waiter = (outcome) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        ambiguousJudgeWaiters.delete(waiter);
-        resolve(outcome);
-      };
-      const timer = setTimeout(() => waiter({ timedOut: true, item: null }), Math.max(1000, Math.min(timeoutMs, 120000)));
-      ambiguousJudgeWaiters.add(waiter);
-      onAbortRegistrar?.(() => waiter({ timedOut: true, item: null }));
-    });
-  }
-
-  // ── 旁路异步分舱长期记忆归纳通道（零聊天阻塞、物理级防跨群串台） ────────
-  // 分舱配置：config.json → persona.memoryCompartments
-  //   { "private:10001": { "dir": "memory/owner", "threshold": 40 }, "group:20002": { "dir": "memory/groups/my_group", "threshold": 150 } }
-  //   每个舱位 = <dir>/summary.md（长期摘要）+ <dir>/diary/（归纳日记）；多个会话可共用同一个 dir。
-  const MEMORY_COMPARTMENTS = new Proxy({}, {
-    get(_t, key) {
-      const raw = personaCfg().memoryCompartments?.[String(key)];
-      if (!raw || typeof raw !== 'object' || !raw.dir) return undefined;
-      const dir = path.resolve(ROOT, String(raw.dir));
-      return {
-        summaryPath: path.join(dir, String(raw.summaryFile || 'summary.md')),
-        diaryDir: path.join(dir, 'diary'),
-        threshold: Math.max(5, Number(raw.threshold) || (String(key).startsWith('group:') ? 150 : 40)),
-      };
-    }
+  const archive = createArchiveChannel(log);
+  const claims = createTurnClaims(api, (key) => state.sessions[key]);
+  const { checkTurnActionV2, shouldBlockDuplicateGroupReplyV2, claimOutboundUniqueMessagesV2,
+    getAgyClaimedSeq, registerClaimedSliceOwnersV2 } = claims;
+  const flashJudge = createFlashJudge({
+    api, log, scheduleWakeV2, getSocialV2State, isConversationBusyV2, acknowledgeMessagesV2,
+    saveSocialV2State, isPaused: () => socialV2.paused, isCreator: (uid) => CREATOR_UIDS.has(uid),
+    personaCreatorLabel, localClockText, personaBotName,
   });
-  const ARCHIVE_CURSOR_FILE = path.join(ROOT, 'state', 'agy-archive-cursor.json');
-  let memoryArchiveCounter = 0;
-  const memoryArchiveQueue = [];
-  const memoryArchiveWaiters = new Set();
-  const lastArchivedSeqByKey = new Map();
-  try {
-    if (fs.existsSync(ARCHIVE_CURSOR_FILE)) {
-      const saved = JSON.parse(fs.readFileSync(ARCHIVE_CURSOR_FILE, 'utf8').replace(/^\uFEFF/, ''));
-      if (Number.isFinite(Number(saved?.counter)) && Number(saved.counter) > 0) {
-        memoryArchiveCounter = Math.floor(Number(saved.counter));
-      }
-      if (saved?.lastArchivedSeq && typeof saved.lastArchivedSeq === 'object') {
-        for (const [k, v] of Object.entries(saved.lastArchivedSeq)) {
-          if (Number.isFinite(Number(v)) && Number(v) >= 0) lastArchivedSeqByKey.set(k, Math.floor(Number(v)));
-        }
-      }
-    }
-  } catch {}
-
-  function saveArchiveCursorState() {
-    try {
-      fs.mkdirSync(path.dirname(ARCHIVE_CURSOR_FILE), { recursive: true });
-      fs.writeFileSync(ARCHIVE_CURSOR_FILE, JSON.stringify({
-        counter: memoryArchiveCounter,
-        lastArchivedSeq: Object.fromEntries(lastArchivedSeqByKey),
-      }, null, 2), 'utf8');
-    } catch {}
-  }
-
-  function maybeEnqueueMemoryArchiveV2(key, st, { force = false, minMessages = 10, triggerReason = 'periodic' } = {}) {
-    const comp = MEMORY_COMPARTMENTS[key];
-    if (!api.isAgyBackend || !comp || !st) return;
-    const latestSeq = Number(st.lastUnreadSeq) || 0;
-    if (!lastArchivedSeqByKey.has(key)) {
-      lastArchivedSeqByKey.set(key, latestSeq);
-      saveArchiveCursorState();
-      return;
-    }
-    const prevSeq = lastArchivedSeqByKey.get(key) || 0;
-    const delta = latestSeq - prevSeq;
-    const requiredDelta = force ? Math.max(1, Number(minMessages) || 10) : comp.threshold;
-    if (delta < requiredDelta) return;
-    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
-    const firstNewHuman = recent.find((m) => m && Number.isSafeInteger(m.seq) && m.seq > prevSeq);
-    const minSelfTime = firstNewHuman?.time ? Number(firstNewHuman.time) - 1000 : 0;
-    const batch = recent
-      .filter((m) => {
-        if (!m) return false;
-        if (Number.isSafeInteger(m.seq)) return m.seq > prevSeq;
-        return m.isSelf && minSelfTime > 0 && Number(m.time || 0) >= minSelfTime;
-      })
-      .slice(-80)
-      .map((m) => ({
-        seq: m.seq ?? null,
-        at: m.time ? localClockText(m.time) : '',
-        sender: m.isSelf ? `${personaBotName()}(你)` : String(m.sender || m.userId || '群友'),
-        userId: m.isSelf ? String(selfUserId || '') : String(m.userId || ''),
-        text: String(m.text || m.plain || '').slice(0, 220),
-      }));
-    lastArchivedSeqByKey.set(key, latestSeq);
-    saveArchiveCursorState();
-    if (batch.length < Math.min(6, requiredDelta)) return;
-    const job = {
-      id: `archive-${++memoryArchiveCounter}`,
-      key,
-      triggerReason,
-      fromSeq: prevSeq + 1,
-      toSeq: latestSeq,
-      summaryPath: comp.summaryPath.replace(/\\/g, '/'),
-      diaryDir: comp.diaryDir.replace(/\\/g, '/'),
-      messages: batch,
-      createdAt: new Date().toISOString(),
-    };
-    saveArchiveCursorState();
-    for (const waiter of memoryArchiveWaiters) {
-      memoryArchiveWaiters.delete(waiter);
-      waiter({ timedOut: false, job });
-      log(`[reserved2] 投递长期记忆归纳批次 ${key} (${job.id}, reason=${triggerReason}, seq ${job.fromSeq}~${job.toSeq})`);
-      return;
-    }
-    if (memoryArchiveQueue.length >= 10) memoryArchiveQueue.shift();
-    memoryArchiveQueue.push(job);
-    log(`[reserved2] 长期记忆归纳批次入队 ${key} (${job.id}, reason=${triggerReason}, seq ${job.fromSeq}~${job.toSeq})`);
-  }
-
-  function waitNextMemoryArchive({ timeoutMs = 55000, onAbortRegistrar } = {}) {
-    if (memoryArchiveQueue.length > 0) {
-      return Promise.resolve({ timedOut: false, job: memoryArchiveQueue.shift() });
-    }
-    return new Promise((resolve) => {
-      let settled = false;
-      const waiter = (outcome) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        memoryArchiveWaiters.delete(waiter);
-        resolve(outcome);
-      };
-      const timer = setTimeout(() => waiter({ timedOut: true, job: null }), Math.max(1000, Math.min(timeoutMs, 120000)));
-      memoryArchiveWaiters.add(waiter);
-      onAbortRegistrar?.(() => waiter({ timedOut: true, job: null }));
-    });
-  }
+  const { cancelFlashReplyJudgeV2, scheduleFlashReplyJudgeV2 } = flashJudge;
+  const memory = createMemoryCompartments({
+    root: ROOT, cfg, api, archive, localClockText, personaBotName, getSelfUserId: () => selfUserId,
+    getGroupState: (key) => socialV2.conversations.get(key), readRoleState, roleFilePath,
+    getRoleLimit: () => roleInjectMaxChars, currentRoleHintV2, getStickerEntries: () => stickerEntries,
+  });
+  const { maybeEnqueueMemoryArchiveV2, clearWorkerHotReloadSigsV2, recallGroupMemoryForPrivateV2 } = memory;
 
   function startConsoleServer() {
     const port = cfg.consolePort ?? 3100;
@@ -4099,7 +3815,7 @@ async function main() {
       if (consoleToken && !tokenMatches) {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=\'/?token=\'+encodeURIComponent(t);</script>');
+          res.end(consoleLoginPage);
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
@@ -4232,183 +3948,15 @@ async function main() {
         }
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          try {
-            res.end(fs.readFileSync(path.join(ROOT, 'public', 'console.html'), 'utf8'));
-          } catch {
-            res.end('控制台页面缺失：qq-bridge/public/console.html');
-          }
+          res.end(readConsolePage(ROOT));
           return;
         }
         // ── Antigravity 本地唤醒通道（仅持有 consoleToken 的本机守护脚本可访问） ──
-        if (url.pathname.startsWith('/api/agy/')) {
-          if (!api.isAgyBackend) {
-            sendJson({ ok: false, error: '当前未启用 agy:// 后端（请将 config.json 的 dsh.baseUrl 设为 "agy://local"）' }, 400);
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/agy/status') {
-            pruneAmbiguousJudge();
-            sendJson({
-              ok: true,
-              mode: currentMode,
-              dshReady,
-              snowluma: snowlumaHealth,
-              waitingJudges: ambiguousJudgeWaiters.size,
-              queuedJudges: ambiguousJudgeQueue.length,
-              waitingArchivists: memoryArchiveWaiters.size,
-              queuedArchives: memoryArchiveQueue.length,
-              ...api.agyStatus(),
-            });
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/agy/archive-wait') {
-            const doneId = String(url.searchParams.get('doneId') || '').trim();
-            if (doneId) log(`[reserved2] 长期记忆归纳完成确认: ${doneId}`);
-            const timeoutMs = Number(url.searchParams.get('timeoutMs')) || 55000;
-            let abortWait = null;
-            req.on('close', () => { abortWait?.(); });
-            const outcome = await waitNextMemoryArchive({
-              timeoutMs,
-              onAbortRegistrar: (fn) => { abortWait = fn; },
-            });
-            if (res.writableEnded || res.destroyed) return;
-            sendJson({
-              ok: true,
-              timedOut: !!outcome.timedOut,
-              job: outcome.job ?? null,
-            });
-            return;
-          }
-          if (req.method === 'POST' && url.pathname === '/api/agy/judge-result') {
-            const body = await readBody();
-            const decideId = String(body?.id ?? '').trim();
-            const shouldWake = body?.wake === true || body?.wake === 1 || String(body?.wake ?? '').toLowerCase() === 'yes';
-            const resObj = applyAmbiguousJudgeDecision(decideId, shouldWake);
-            sendJson({ ok: true, result: resObj });
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/agy/judge-wait') {
-            lastJudgePollAt = Date.now();
-            const decideId = String(url.searchParams.get('decideId') || '').trim();
-            if (decideId) {
-              const rawWake = String(url.searchParams.get('wake') || '').toLowerCase();
-              const shouldWake = rawWake === '1' || rawWake === 'true' || rawWake === 'yes';
-              applyAmbiguousJudgeDecision(decideId, shouldWake);
-            }
-            const timeoutMs = Number(url.searchParams.get('timeoutMs')) || 55000;
-            let abortWait = null;
-            req.on('close', () => { abortWait?.(); });
-            const outcome = await waitNextAmbiguousJudge({
-              timeoutMs,
-              onAbortRegistrar: (fn) => { abortWait = fn; },
-            });
-            if (res.writableEnded || res.destroyed) return;
-            sendJson({
-              ok: true,
-              timedOut: !!outcome.timedOut,
-              judge: outcome.item ?? null,
-            });
-            return;
-          }
-          if (req.method === 'POST' && url.pathname === '/api/agy/claim') {
-            const { key, token, turn, workerId } = await readBody();
-            if (!agentTokenOk(key, token) || !v2SessionAllowed(key) || currentMode !== 'reserved2'
-                || socialV2.paused || cfg.socialV2.enabled === false) {
-              sendJson({ ok: false, error: '会话令牌无效或当前不接受回复' }, 403);
-              return;
-            }
-            const result = api.claimTurn(turn, state.sessions[key], workerId);
-            if (result === 'stale') { sendJson({ ok: false, error: '该回合已过期或属于其他 Worker' }, 409); return; }
-            sendJson({ ok: true, duplicate: result === 'duplicate' });
-            return;
-          }
-          if (req.method === 'POST' && url.pathname === '/api/agy/complete') {
-            const body = await readBody();
-            let sessionId = body?.sessionId ? String(body.sessionId) : '';
-            if (!sessionId && body?.key && state.sessions[body.key]) {
-              sessionId = state.sessions[body.key];
-            }
-            const workerId = body?.workerId ? String(body.workerId) : '';
-            const forceAll = body?.forceAll === true;
-            const completed = api.completeTurn({
-              sessionId,
-              turn: body?.turn ? String(body.turn) : '',
-              workerId: (!forceAll && body?.all === true && !body?.turn) ? (workerId || 'primary') : workerId,
-              replyText: typeof body?.replyText === 'string' ? body.replyText : '',
-              all: forceAll,
-            });
-            sendJson({ ok: true, completed });
-            return;
-          }
-          if (req.method === 'GET' && url.pathname === '/api/agy/wait') {
-            const workerId = (url.searchParams.get('workerId') || 'primary').trim();
-            const defaultPriority = workerId === 'primary' ? 10 : 5;
-            const priorityParam = url.searchParams.get('priority');
-            const priority = priorityParam !== null && priorityParam !== '' ? Number(priorityParam) : defaultPriority;
-            const finishTurn = url.searchParams.get('finishTurn') || '';
-            const finishSessionId = url.searchParams.get('finishSessionId') || '';
-            const finishWorker = url.searchParams.get('finishWorker') === '1';
-            const finishAll = url.searchParams.get('finishAll') === '1';
-            const forceAll = url.searchParams.get('forceAll') === '1';
-            if (finishTurn || finishSessionId || finishWorker || finishAll) {
-              api.completeTurn({
-                sessionId: finishSessionId,
-                turn: finishTurn,
-                workerId: (finishWorker || (finishAll && !forceAll)) ? workerId : '',
-                all: forceAll,
-              });
-            }
-            const timeoutMs = Number(url.searchParams.get('timeoutMs')) || 55000;
-            const maxTurns = Number(url.searchParams.get('maxTurns')) || 0;
-            const resetWorkerTurns = url.searchParams.get('resetTurns') === '1';
-            if (resetWorkerTurns) {
-              clearWorkerHotReloadSigsV2(workerId);
-            }
-            let abortWait = null;
-            req.on('close', () => { abortWait?.(); });
-            const outcome = await api.waitNextWake({
-              timeoutMs,
-              workerId,
-              priority,
-              maxTurns,
-              resetWorkerTurns,
-              onAbortRegistrar: (fn) => { abortWait = fn; },
-            });
-            if (res.writableEnded || res.destroyed) return;
-            if (outcome.superseded) {
-              sendJson({
-                ok: true,
-                timedOut: false,
-                superseded: true,
-                workerId,
-                wake: null,
-              });
-            } else if (outcome.rotate) {
-              sendJson({
-                ok: true,
-                timedOut: false,
-                rotate: true,
-                workerId,
-                turnsCompleted: outcome.turnsCompleted || maxTurns,
-                wake: null,
-              });
-            } else if (outcome.wake) {
-              const key = reverse.get(outcome.wake.sessionId) ?? null;
-              const agentToken = key ? (getSocialV2State(key)?.agentToken || '') : '';
-              const hotPrefix = buildWorkerHotReloadPrefixV2(workerId, key);
-              const wakePayload = hotPrefix
-                ? { ...outcome.wake, text: `${hotPrefix}${outcome.wake.text || ''}`, key, agentToken, mode: currentMode, workerId }
-                : { ...outcome.wake, key, agentToken, mode: currentMode, workerId };
-              sendJson({
-                ok: true,
-                timedOut: false,
-                wake: wakePayload,
-              });
-            } else {
-              sendJson({ ok: true, timedOut: true, wake: null });
-            }
-            return;
-          }
-        }
+        if (url.pathname.startsWith('/api/agy/') && await handleAgyRequest({
+          req, res, url, sendJson, readBody, api, judge: flashJudge, archive, memory,
+          getMode: () => currentMode, dshReady, snowlumaHealth, agentTokenOk, v2SessionAllowed,
+          socialV2, cfg, state, reverse, getSocialV2State, log,
+        })) return;
         if (req.method === 'GET' && url.pathname === '/api/status') {
           const rs = readRoleState();
           // 带 agent token 的调用来自 QQ 群里的 AI：只能拿到它自己该知道的运行状态。
@@ -5423,8 +4971,8 @@ async function main() {
             }
             merged[sub] = { ...cfg.socialV2[sub], ...current[sub], ...delta };
           }
-          if (body.tts?.provider !== undefined && !['elevenlabs', 'google'].includes(body.tts.provider)) {
-            sendJson({ ok: false, error: 'TTS 提供商应为 google 或 elevenlabs' }, 400);
+          if (body.tts?.provider !== undefined && !['fish', 'elevenlabs', 'google'].includes(body.tts.provider)) {
+            sendJson({ ok: false, error: 'TTS 提供商应为 fish、google 或 elevenlabs' }, 400);
             return;
           }
           if (body.tts?.elevenlabs !== undefined) {
@@ -5434,6 +4982,14 @@ async function main() {
               return;
             }
             merged.tts.elevenlabs = { ...current.tts?.elevenlabs, ...el };
+          }
+          if (body.tts?.fish !== undefined) {
+            const fi = body.tts.fish;
+            if (!fi || typeof fi !== 'object' || Array.isArray(fi)) {
+              sendJson({ ok: false, error: 'fish 配置格式无效' }, 400);
+              return;
+            }
+            merged.tts.fish = { ...current.tts?.fish, ...fi };
           }
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
           for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
@@ -5853,6 +5409,7 @@ async function main() {
             return;
           }
           const markedCount = acknowledgeMessagesV2(st, throughSeq);
+          if (workerAck) claims.noteAcknowledged(body.turn, throughSeq);
           st.lastActionAt = Date.now();
           st.wakeConfig.noActionCount = 0;
           // 防止“有限潜水被 timeout 唤醒后 sleepUntil 被清空、又 mark_read 收尾”导致无定时器无触发条件的静默态。
@@ -6319,8 +5876,7 @@ async function main() {
           }
           if (body.turn) {
             const turnKey = String(body.turn).trim();
-            const autoReplyId = agyTurnDefaultReply.get(turnKey);
-            if (turnKey) agyTurnDefaultReply.delete(turnKey);
+            const autoReplyId = claims.takeDefaultReply(turnKey);
             if (kind === 'group' && (replyToMessageId === undefined || replyToMessageId === null || String(replyToMessageId).trim() === '') && autoReplyId) {
               replyToMessageId = autoReplyId;
             }
@@ -6378,7 +5934,8 @@ async function main() {
             quotedInfo = resolved.info;
             actualReplyToMessageId = resolved.messageId;
           }
-          const turnDupReason = checkAndClaimTurnActionV2(key, body.turn, `text:${actualReplyToMessageId || ''}:${messages.join('\n')}`);
+          const actionSig = `text:${actualReplyToMessageId || ''}:${messages.join('\n')}`;
+          const turnDupReason = checkTurnActionV2(key, body.turn, actionSig);
           if (turnDupReason) {
             for (let i = 0; i < messages.length; i++) {
               const idx = st.sendTimes.indexOf(now);
@@ -6423,6 +5980,7 @@ async function main() {
             ? delays
             : computeGapsV2(finalMessages, gapMode, gapMs, gaps, sendCfg);
           try {
+            claims.recordTurnAction(key, body.turn, actionSig);
             const sentMessages = await sendMessagesV2(key, finalMessages, finalDelays, actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
             noteReplyInterlocutorV2(st, { replyToMessageId: actualReplyToMessageId, atUserId, quotedInfo });
@@ -6823,7 +6381,7 @@ async function main() {
             let usedProvider;
             try {
               const sent = await sendVoiceForV2(key, fileName, {
-                label: '[语音] ' + text.slice(0, 80), verify: body.verify, guard,
+                label: '[语音] ' + text.slice(0, 80), verify: body.verify, guard, turn: body.turn,
                 prepare: async () => {
                   const result = await synthesizeSpeech(text, cfg.socialV2.tts, body, voice.maxBytes);
                   usedProvider = result.provider;
@@ -6857,6 +6415,7 @@ async function main() {
               return;
             }
             const sent = await sendVoiceForV2(key, body.voice ?? body.file, {
+              turn: body.turn,
               guard, label: body.label ? String(body.label).slice(0, 100) : '',
               verify: body.verify,
               readback: body.readback === true,
@@ -6915,8 +6474,7 @@ async function main() {
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           if (body.turn) {
             const turnKey = String(body.turn).trim();
-            const autoReplyId = agyTurnDefaultReply.get(turnKey);
-            if (turnKey) agyTurnDefaultReply.delete(turnKey);
+            const autoReplyId = claims.takeDefaultReply(turnKey);
             if (kind === 'group' && (replyToMessageId === undefined || replyToMessageId === null || String(replyToMessageId).trim() === '') && autoReplyId) {
               replyToMessageId = autoReplyId;
             }
@@ -6937,7 +6495,8 @@ async function main() {
             quotedInfo = resolved.info;
             actualReplyToMessageId = resolved.messageId;
           }
-          const stickerTurnDup = checkAndClaimTurnActionV2(key, body.turn, `sticker:${actualReplyToMessageId || ''}:${stickerId}`);
+          const actionSig = `sticker:${actualReplyToMessageId || ''}:${stickerId}`;
+          const stickerTurnDup = checkTurnActionV2(key, body.turn, actionSig);
           if (stickerTurnDup) {
             log(`[reserved2] 拦截重复回合发表情 ${key} (turn=${body.turn || '-'}): ${stickerTurnDup}`);
             sendJson({ ok: true, key, sent: 0, failed: 0, skippedDuplicate: true, reason: stickerTurnDup });
@@ -6963,6 +6522,7 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            claims.recordTurnAction(key, body.turn, actionSig);
             const sent = await sendStickerV2(key, stickerId, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
@@ -7034,8 +6594,7 @@ async function main() {
           if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
           if (body.turn) {
             const turnKey = String(body.turn).trim();
-            const autoReplyId = agyTurnDefaultReply.get(turnKey);
-            if (turnKey) agyTurnDefaultReply.delete(turnKey);
+            const autoReplyId = claims.takeDefaultReply(turnKey);
             if (kind === 'group' && (replyToMessageId === undefined || replyToMessageId === null || String(replyToMessageId).trim() === '') && autoReplyId) {
               replyToMessageId = autoReplyId;
             }
@@ -7052,7 +6611,8 @@ async function main() {
             quotedInfo = resolved.info;
             actualReplyToMessageId = resolved.messageId;
           }
-          const imgTurnDup = checkAndClaimTurnActionV2(key, body.turn, `img:${actualReplyToMessageId || ''}:${imagePathRaw}`);
+          const actionSig = `img:${actualReplyToMessageId || ''}:${imagePathRaw}`;
+          const imgTurnDup = checkTurnActionV2(key, body.turn, actionSig);
           if (imgTurnDup) {
             log(`[reserved2] 拦截重复回合发图片 ${key} (turn=${body.turn || '-'}): ${imgTurnDup}`);
             sendJson({ ok: true, key, sent: 0, failed: 0, skippedDuplicate: true, reason: imgTurnDup });
@@ -7078,6 +6638,7 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            claims.recordTurnAction(key, body.turn, actionSig);
             const sent = await sendImageV2(key, imagePathRaw, {
               replyToMessageId: actualReplyToMessageId,
               atUserId
@@ -7179,8 +6740,12 @@ async function main() {
             sendJson({ ok: false, error: '外包画师手头正忙（最多并发 2 张 / 10 分钟 6 张），稍后再试' }, 429);
             return;
           }
+          const actionSig = 'draw:' + prompt;
+          const duplicateDraw = checkTurnActionV2(key, body.turn, actionSig);
+          if (duplicateDraw) { sendJson({ ok: false, error: duplicateDraw }, 409); return; }
           const autoSelfRef = nameMentionHit(prompt) || /自画像|画一张你自己|画你自己/i.test(prompt);
           const selfRef = body.selfRef === true || (body.selfRef !== false && autoSelfRef);
+          claims.recordTurnAction(key, body.turn, actionSig);
           const jobId = `cdx_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
           codexDrawInFlight += 1;
           codexDrawTimes.push(now);
@@ -8458,7 +8023,8 @@ async function main() {
             quotedInfo = resolved.info;
             actualReplyToMessageId = resolved.messageId;
           }
-          const legacyTurnDup = checkAndClaimTurnActionV2(key, body.turn, `text:${actualReplyToMessageId || ''}:${message}`);
+          const actionSig = `text:${actualReplyToMessageId || ''}:${message}`;
+          const legacyTurnDup = checkTurnActionV2(key, body.turn, actionSig);
           if (legacyTurnDup) {
             log(`[reserved2] 拦截重复回合发送 ${key} (turn=${body.turn || '-'}): ${legacyTurnDup}`);
             sendJson({ ok: true, key, sent: 0, failed: 0, skippedDuplicate: true, reason: legacyTurnDup });
@@ -8493,6 +8059,7 @@ async function main() {
             }
             st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            claims.recordTurnAction(key, body.turn, actionSig);
             const sentMessages = await sendMessagesV2(key, [message], [], actualReplyToMessageId, atUserId);
             recordSentMessagesV2(key, sentMessages);
             noteReplyInterlocutorV2(st, { replyToMessageId: actualReplyToMessageId, atUserId, quotedInfo });
@@ -8670,6 +8237,7 @@ async function main() {
         sendJson({ ok: false, error: error?.message ?? String(error) }, status);
       }
     });
+    server.once('close', memory.close);
     server.listen(port, '127.0.0.1', () => {
       log(`本地控制台已启动：http://127.0.0.1:${port}`);
     });
@@ -10679,19 +10247,13 @@ async function main() {
     if (assignedTurn && wakeSnapshot) {
       registerClaimedSliceOwnersV2(key, assignedTurn, wakeSnapshot);
       const defReplyId = computeDefaultGroupReplyIdV2(key, wakeSnapshot, opts.wakeReason);
-      if (defReplyId) {
-        agyTurnDefaultReply.set(String(assignedTurn), defReplyId);
-        if (agyTurnDefaultReply.size > 200) {
-          const oldest = agyTurnDefaultReply.keys().next().value;
-          if (oldest) agyTurnDefaultReply.delete(oldest);
-        }
-      }
+      if (defReplyId) claims.setDefaultReply(String(assignedTurn), defReplyId);
     }
     if (wakeSnapshot && isCurrentSession(key, sessionId)
         && socialV2.conversations.get(canonicalV2Key(key)) === wakeState
         && wakeState.agentToken === wakeToken) {
       if (api.isAgyBackend && wakeSnapshot.messages.length) {
-        agyClaimedSeq.set(wakeState, wakeSnapshot.readThroughSeq);
+        claims.setClaimedSeq(wakeState, wakeSnapshot.readThroughSeq);
       }
       // Acceptance grants visibility, never acknowledgement. New arrivals and
       // rejected/stale deliveries must not be cleared by an old cursor.
@@ -11263,38 +10825,19 @@ async function main() {
       ...(Array.isArray(st?.recentMessages) ? st.recentMessages : []),
       ...(Array.isArray(st?.unread) ? st.unread : []),
     ];
-    const foundBySeq = pool.find((m) => m && String(m.seq) === refStr);
-    const foundByMsgId = pool.find((m) => m && m.messageId && String(m.messageId) === refStr);
-    const found = foundBySeq || foundByMsgId;
-    if (found && found.messageId && String(found.messageId) !== refStr) {
-      const realId = String(found.messageId);
-      const realInfo = await resolveReplyInfo(kind, convId, realId);
+    const found = pool.find((m) => m?.messageId && String(m.seq) === refStr)
+      || pool.find((m) => m?.messageId && String(m.messageId) === refStr);
+    if (found) {
+      const messageId = String(found.messageId);
       return {
-        info: realInfo || {
-          sender: String(found.sender || ''),
-          text: String(found.text || found.plain || '').slice(0, 200),
-          userId: found.userId ?? null,
-          messageId: realId,
-          seq: found.seq
+        messageId, info: {
+          sender: String(found.sender || ''), text: String(found.text || found.plain || '').slice(0, 200),
+          userId: found.userId ?? null, messageId, seq: found.seq,
         },
-        messageId: realId
       };
     }
-    let info = await resolveReplyInfo(kind, convId, refStr);
+    const info = await resolveReplyInfo(kind, convId, refStr);
     if (info) return { info, messageId: refStr };
-    if (found && found.messageId) {
-      const realId = String(found.messageId);
-      return {
-        info: {
-          sender: String(found.sender || ''),
-          text: String(found.text || found.plain || '').slice(0, 200),
-          userId: found.userId ?? null,
-          messageId: realId,
-          seq: found.seq
-        },
-        messageId: realId
-      };
-    }
     return null;
   }
 
@@ -11789,14 +11332,6 @@ async function main() {
     return `${lines.join('\n')}\n\n`;
   }
 
-  const agyClaimedSeq = new WeakMap();
-  function getAgyClaimedSeq(key, st) {
-    const sid = state.sessions[key];
-    if (!sid || api.activeTurnCount(sid) === 0) agyClaimedSeq.delete(st);
-    return Math.max(agyClaimedSeq.get(st) || 0, Number(st.lastReadThroughSeq) || 0);
-  }
-
-  const agyTurnDefaultReply = new Map();
   function computeDefaultGroupReplyIdV2(key, wakeSnapshot, wakeReason) {
     if (!String(key ?? '').startsWith('group:')) return null;
     if (!wakeSnapshot || !Array.isArray(wakeSnapshot.messages) || wakeSnapshot.messages.length === 0) return null;
@@ -11825,125 +11360,6 @@ async function main() {
     if (directHits.length > 0 && directSpeakers.size === 1) {
       return String(directHits[directHits.length - 1].messageId);
     }
-    return null;
-  }
-
-  const agyClaimedMsgOwner = new Map();
-  const agyRepliedTargetIds = new Map();
-  const agyTurnActionClaims = new Map();
-  const agyRecentOutboundByKey = new Map();
-
-  function normalizeOutboundDedupTextV2(raw) {
-    return String(raw ?? '').replace(/[\s\p{P}\p{S}]+/gu, '').toLowerCase();
-  }
-
-  function checkAndClaimTurnActionV2(key, turnRaw, actionSig) {
-    const turn = String(turnRaw ?? '').trim();
-    if (!turn) return null;
-    if (api.isAgyBackend && !api.isTurnActive(turn, state.sessions[key] || null)) {
-      return `唤醒回合 ${turn} 已完结，拦截重复重放`;
-    }
-    const now = Date.now();
-    for (const [k, at] of agyTurnActionClaims.entries()) {
-      if (now - at > 1_800_000) agyTurnActionClaims.delete(k);
-    }
-    const claimKey = `${key}::${turn}::${actionSig}`;
-    if (agyTurnActionClaims.has(claimKey)) {
-      return `同一回合 ${turn} 相同内容已提交过`;
-    }
-    agyTurnActionClaims.set(claimKey, now);
-    return null;
-  }
-
-  function claimOutboundUniqueMessagesV2(key, st, messages) {
-    const now = Date.now();
-    let hist = agyRecentOutboundByKey.get(key);
-    if (!hist) {
-      hist = [];
-      const seedList = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
-      for (const m of seedList.slice(-40)) {
-        if (!m || !m.isSelf || m.sticker) continue;
-        const raw = String(m.plain || m.text || '').trim();
-        if (!raw || raw.startsWith('[表情包:') || raw.startsWith('[图片:')) continue;
-        const ts = Number(m.time) || 0;
-        if (ts > 0 && now - ts < 600_000) {
-          hist.push({ raw, norm: normalizeOutboundDedupTextV2(raw), at: ts });
-        }
-      }
-      agyRecentOutboundByKey.set(key, hist);
-    }
-    for (let i = hist.length - 1; i >= 0; i -= 1) {
-      if (now - hist[i].at > 600_000) hist.splice(i, 1);
-    }
-    const accepted = [];
-    const addedEntries = [];
-    for (const m of Array.isArray(messages) ? messages : []) {
-      const raw = String(m ?? '').trim();
-      if (!raw) continue;
-      const norm = normalizeOutboundDedupTextV2(raw);
-      const isDup = hist.some((h) => {
-        if (h.raw === raw && now - h.at < 90_000) return true;
-        if (norm.length >= 4 && h.norm === norm && now - h.at < 600_000) return true;
-        return false;
-      });
-      if (isDup) continue;
-      const entry = { raw, norm, at: now };
-      hist.push(entry);
-      addedEntries.push(entry);
-      accepted.push(raw);
-    }
-    return {
-      accepted,
-      rollback() {
-        for (const e of addedEntries) {
-          const idx = hist.indexOf(e);
-          if (idx >= 0) hist.splice(idx, 1);
-        }
-      },
-    };
-  }
-
-  function registerClaimedSliceOwnersV2(key, assignedTurn, wakeSnapshot) {
-    if (!assignedTurn || !wakeSnapshot || !Array.isArray(wakeSnapshot.messages)) return;
-    const now = Date.now();
-    for (const [k, v] of agyClaimedMsgOwner.entries()) {
-      if (now - v.at > 180000) agyClaimedMsgOwner.delete(k);
-    }
-    for (const m of wakeSnapshot.messages) {
-      if (m && !m.isSelf && m.messageId) {
-        agyClaimedMsgOwner.set(`${key}:${String(m.messageId)}`, { turn: String(assignedTurn), at: now });
-      }
-    }
-  }
-
-  function shouldBlockDuplicateGroupReplyV2(key, actualReplyToMessageId, turnRaw, actionKind = 'text') {
-    if (!String(key ?? '').startsWith('group:')) return null;
-    const mid = String(actualReplyToMessageId ?? '').trim();
-    if (!mid) return null;
-    const turn = String(turnRaw ?? '').trim();
-    const now = Date.now();
-    for (const [k, v] of agyRepliedTargetIds.entries()) {
-      if (now - v.at > 600000) agyRepliedTargetIds.delete(k);
-    }
-    const dk = `${key}:${mid}`;
-    const prevReplied = agyRepliedTargetIds.get(dk);
-    if (prevReplied) {
-      if (!turn || prevReplied.turn !== turn) {
-        return `已被 ${prevReplied.turn || '前序回合'} 回复过`;
-      }
-      if (actionKind === 'text' && prevReplied.hasText) {
-        return `同一回合 ${turn} 已对该消息发送过文本回复`;
-      }
-    }
-    const owner = agyClaimedMsgOwner.get(dk);
-    if (owner && turn && owner.turn !== turn && api?.isTurnActive?.(owner.turn)) {
-      return `已分配给正在执行的并发回合 ${owner.turn}`;
-    }
-    agyRepliedTargetIds.set(dk, {
-      turn,
-      at: now,
-      hasText: Boolean(prevReplied?.hasText || actionKind === 'text'),
-    });
     return null;
   }
 
@@ -12045,305 +11461,13 @@ async function main() {
     return `【你的身份】你在 QQ 上的昵称是${label}${idText}。${callBits}；群名片可能与昵称不同，at/引用段里带${id ? ` ${id} ` : '你的 QQ 号'}就是在叫你。\n\n`;
   }
 
-  const agyLastRoleSig = new Map();
-  const agyLastMemSig = new Map();
-  const agyLastStickerSig = new Map();
-
-  function clearWorkerHotReloadSigsV2(workerId) {
-    if (!workerId) {
-      agyLastRoleSig.clear();
-      agyLastMemSig.clear();
-      agyLastStickerSig.clear();
-      return;
-    }
-    const prefix = `${workerId}::`;
-    for (const k of [...agyLastRoleSig.keys()]) {
-      if (k.startsWith(prefix)) agyLastRoleSig.delete(k);
-    }
-    for (const k of [...agyLastMemSig.keys()]) {
-      if (k.startsWith(prefix)) agyLastMemSig.delete(k);
-    }
-    for (const k of [...agyLastStickerSig.keys()]) {
-      if (k.startsWith(prefix)) agyLastStickerSig.delete(k);
-    }
-  }
-
-  function buildWorkerHotReloadPrefixV2(workerId, key) {
-    if (!key) return '';
-    const wid = String(workerId || 'primary').trim() || 'primary';
-    const slotKey = `${wid}::${key}`;
-    let prefix = '';
-    const roleState = readRoleState();
-    if (roleState.role) {
-      try {
-        const rf = roleFilePath(roleState.role);
-        const stat = fs.statSync(rf);
-        const sig = [roleState.role, stat.mtimeMs, stat.size, roleInjectMaxChars].join(':');
-        if (agyLastRoleSig.get(slotKey) !== sig) {
-          const cardText = currentRoleHintV2();
-          agyLastRoleSig.set(slotKey, sig);
-          if (cardText) {
-            prefix += `【角色卡已热更新：${roleState.role}（请立即以此最新人设为准，覆盖旧习惯）】\n${cardText}\n\n`;
-          }
-        }
-      } catch {}
-    } else if (agyLastRoleSig.delete(slotKey)) {
-      prefix += '【角色卡已清除】从本轮起使用默认身份。\n\n';
-    }
-    const comp = MEMORY_COMPARTMENTS[key];
-    const isGroupKey = String(key).startsWith('group:');
-    const rawGroupCfg = personaCfg().memoryCompartments?.[String(key)];
-    const privComp = isGroupKey && rawGroupCfg?.includePrivate !== false
-      ? (MEMORY_COMPARTMENTS[`private:${cfg.ownerQQ}`]
-        || (() => {
-          const privKey = Object.keys(personaCfg().memoryCompartments || {}).find((k) => k.startsWith('private:'));
-          return privKey ? MEMORY_COMPARTMENTS[privKey] : undefined;
-        })())
-      : undefined;
-    const hasOwnMem = Boolean(comp && fs.existsSync(comp.summaryPath));
-    const hasPrivMem = Boolean(privComp && privComp.summaryPath !== comp?.summaryPath && fs.existsSync(privComp.summaryPath));
-    if (hasOwnMem || hasPrivMem) {
-      try {
-        const ownMtime = hasOwnMem ? String(Math.floor(fs.statSync(comp.summaryPath).mtimeMs)) : '0';
-        const privMtime = hasPrivMem ? String(Math.floor(fs.statSync(privComp.summaryPath).mtimeMs)) : '0';
-        const combinedMemSig = `${ownMtime}:${privMtime}`;
-        if (agyLastMemSig.get(slotKey) !== combinedMemSig) {
-          agyLastMemSig.set(slotKey, combinedMemSig);
-          if (hasOwnMem) {
-            const memText = fs.readFileSync(comp.summaryPath, 'utf8').trim().slice(0, 1600);
-            if (memText) {
-              const title = isGroupKey
-                ? `【本群专属长期记忆精华（仅限 ${key} 使用，与其他群严格隔离）】`
-                : `【本会话分舱长期记忆精华（Creator 私聊记忆）】`;
-              prefix += `${title}\n${memText}\n\n`;
-            }
-          }
-          if (hasPrivMem) {
-            const privText = fs.readFileSync(privComp.summaryPath, 'utf8').trim().slice(0, 1600);
-            if (privText) {
-              prefix += `【单向挂载：Creator 私聊长期记忆（群内与 Creator 互动时共享默契背景，但私密细节勿向无关群友外泄）】\n${privText}\n\n`;
-            }
-          }
-        }
-      } catch {}
-    }
-    const stickerCfg = cfg.socialV2?.sticker ?? {};
-    if (stickerCfg.enabled !== false && stickerCfg.includeInPrompt !== false && stickerEntries.length > 0) {
-      const stickerSlotKey = `${wid}::stickers`;
-      const maxS = stickerCfg.promptMaxStickers ?? 48;
-      const stickerSig = crypto.createHash('sha1').update(
-        stickerEntries.slice(0, maxS).map((s) => `${s.md5 || s.id}:${s.localNote || s.desc || ''}`).join('|')
-      ).digest('hex').slice(0, 16);
-      if (agyLastStickerSig.get(stickerSlotKey) !== stickerSig) {
-        const fullStickerCtx = buildStickerContext(stickerEntries, maxS);
-        agyLastStickerSig.set(stickerSlotKey, stickerSig);
-        if (fullStickerCtx) {
-          prefix += `【本线程表情夹清单（旧历史短 ID 如 C76FD5B1 已作废，请严格只使用下方最新清单里的 8 位短 ID）】\n${buildCompactStickerHint()}\n${fullStickerCtx}\n\n`;
-        }
-      }
-    }
-    return prefix;
-  }
-
-  const PRIVATE_RECALL_STOPWORDS = new Set([
-    '什么', '怎么', '为什么', '今天', '昨天', '刚才', '最近', '现在', '那个', '这个',
-    '一个', '一下', '不是', '没有', '可以', '就是', '还是', '觉得', '知道', '看到',
-    '听到', '出来', '进去', '哈哈', '真的', '其实', '而且', '不过', '如果', '因为',
-    '所以', '喜欢', '讨厌', '感觉', '自己', '我们', '你们', '他们', '主人', '墨宝',
-    '妮亚', '乃爱', '基米', '哈基米', '表情', '语音', '私聊', '抱抱', '亲亲', '睡觉',
-    '晚安', '早安', '干嘛', '在吗', '干活', '说话', '起来', '看看', '说说', '哪里',
-    '哪个', '多少', '时候', '已经', '一直', '突然', '到底', '居然', '竟然', '简直',
-  ]);
-
-  function recallGroupMemoryForPrivateV2(key, st) {
-    if (!String(key ?? '').startsWith('private:') || !st) return '';
-    const unreadNonSelf = (Array.isArray(st.unread) ? st.unread : []).filter((m) => m && !m.isSelf);
-    const recentNonSelf = (Array.isArray(st.recentMessages) ? st.recentMessages : []).filter((m) => m && !m.isSelf);
-    const primaryMsgs = unreadNonSelf.length > 0 ? unreadNonSelf : recentNonSelf.slice(-1);
-    const primaryText = primaryMsgs.map((m) => String(m.plain || m.text || '')).join(' ').trim();
-    if (!primaryText) return '';
-    const contextText = [...recentNonSelf.slice(-2), ...unreadNonSelf]
-      .map((m) => String(m.plain || m.text || ''))
-      .join(' ')
-      .trim();
-    const isExplicitGroupQuery = /(?:群里|海沟|higo|群友|水群|那群人|那帮人|他们.*聊|都在聊|群.*聊|在群|群动态)/i.test(primaryText);
-    const qLower = primaryText.toLowerCase();
-    const ctxLower = contextText.toLowerCase();
-
-    const asciiIgnore = new Set(['nya', 'nia', 'creator', 'qq', 'ai', 'ok', 'bot', 'http', 'https', 'com', 'cn']);
-    const asciiTokens = [...new Set((qLower.match(/[a-z0-9]{2,}/g) || []).filter((t) => !asciiIgnore.has(t) && !/^\d{6,}$/.test(t)))];
-
-    const cjkRuns = primaryText.match(/[\u4e00-\u9fff]{2,}/g) || [];
-    const cjkBigrams = new Set();
-    const cjkTrigrams = new Set();
-    for (const run of cjkRuns) {
-      for (let i = 0; i <= run.length - 2; i += 1) {
-        const bg = run.slice(i, i + 2);
-        if (!PRIVATE_RECALL_STOPWORDS.has(bg) && !/[群里海沟]/.test(bg)) cjkBigrams.add(bg);
-      }
-      for (let i = 0; i <= run.length - 3; i += 1) {
-        const tg = run.slice(i, i + 3);
-        if (!PRIVATE_RECALL_STOPWORDS.has(tg)) cjkTrigrams.add(tg);
-      }
-    }
-
-    const groupKeys = Object.keys(personaCfg().memoryCompartments || {}).filter((k) => k.startsWith('group:'));
-    if (groupKeys.length === 0) return '';
-
-    const scoredLines = [];
-    const matchedLiveMsgs = [];
-    const seenLines = new Set();
-
-    for (const gKey of groupKeys) {
-      const gComp = MEMORY_COMPARTMENTS[gKey];
-      if (!gComp) continue;
-      const gDir = path.dirname(gComp.summaryPath);
-      const candidateFiles = [];
-      if (fs.existsSync(gComp.summaryPath)) {
-        candidateFiles.push({ file: gComp.summaryPath, tag: '常驻' });
-      }
-      const peopleDir = path.join(gDir, 'people');
-      if (fs.existsSync(peopleDir)) {
-        try {
-          for (const fn of fs.readdirSync(peopleDir).filter((f) => f.endsWith('.md')).slice(0, 10)) {
-            candidateFiles.push({ file: path.join(peopleDir, fn), tag: '人物' });
-          }
-        } catch {}
-      }
-      let newestDiaryBullets = [];
-      if (fs.existsSync(gComp.diaryDir)) {
-        try {
-          const diaryFiles = fs.readdirSync(gComp.diaryDir)
-            .filter((f) => f.endsWith('.md'))
-            .map((fn) => {
-              const full = path.join(gComp.diaryDir, fn);
-              let mtime = 0;
-              try { mtime = fs.statSync(full).mtimeMs; } catch {}
-              const isDailyConsolidated = /^\d{4}-\d{2}-\d{2}\.md$/.test(fn);
-              return { fn, full, mtime, isDailyConsolidated };
-            })
-            .sort((a, b) => (b.isDailyConsolidated - a.isDailyConsolidated) || (b.mtime - a.mtime) || b.fn.localeCompare(a.fn))
-            .slice(0, 6);
-          for (let idx = 0; idx < diaryFiles.length; idx += 1) {
-            const df = diaryFiles[idx];
-            const tag = df.fn.replace(/\.md$/, '');
-            candidateFiles.push({ file: df.full, tag, isNewestDiary: idx === 0 });
-          }
-        } catch {}
-      }
-
-      const knownEntities = new Set(['半瓶醋', 'Cyber马', 'Heavy rain', '莱德潘达', '糖醋小鸡排', 'Stannn', '千丝纸折鸢', 'stay with me', '隐痛', '夜吻', '偷得浮生半日闲', 'Usher808', '斫青客', '大矿工', '没头脑的鱼', '大白海豹', '朱抬头', '心不清', '发展者', 'AKnight', 'KeA', '鸭鸭']);
-
-      for (const cf of candidateFiles) {
-        let raw = '';
-        try { raw = fs.readFileSync(cf.file, 'utf8'); } catch { continue; }
-        const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith('- ') || l.startsWith('* '));
-        if (cf.isNewestDiary && lines.length > 0) {
-          newestDiaryBullets = lines.slice(-3).map((l) => `[${cf.tag}] ${l.replace(/^[-*]\s*/, '')}`);
-        }
-        for (const line of lines) {
-          for (const m of line.matchAll(/`([^`]{2,20})`/g)) {
-            const ent = m[1].trim();
-            if (!/^(?:Creator|Nya|Nia|group:|private:|\d+)$/i.test(ent)) knownEntities.add(ent);
-          }
-          const lineLower = line.toLowerCase();
-          let score = 0;
-          for (const ent of knownEntities) {
-            const entLower = ent.toLowerCase();
-            if (entLower.length >= 2 && (qLower.includes(entLower) || ctxLower.includes(entLower))) {
-              if (lineLower.includes(entLower)) score += 6;
-            } else if (ent.length >= 3) {
-              const tail2 = ent.slice(-2).toLowerCase();
-              if (/[\u4e00-\u9fff]{2}/.test(tail2) && qLower.includes(tail2) && lineLower.includes(entLower)) {
-                score += 5;
-              }
-            }
-          }
-          for (const tok of asciiTokens) {
-            if (lineLower.includes(tok)) score += 4;
-          }
-          for (const tg of cjkTrigrams) {
-            if (line.includes(tg)) score += 4;
-          }
-          let bgHits = 0;
-          for (const bg of cjkBigrams) {
-            if (line.includes(bg)) bgHits += 1;
-          }
-          if (bgHits >= 2) {
-            score += bgHits * 3;
-          } else if (bgHits === 1 && (isExplicitGroupQuery || asciiTokens.length > 0)) {
-            score += 2;
-          }
-          if (score >= 4) {
-            const cleanLine = `[${cf.tag}] ${line.replace(/^[-*]\s*/, '').slice(0, 160)}`;
-            if (!seenLines.has(cleanLine)) {
-              seenLines.add(cleanLine);
-              scoredLines.push({ score, text: cleanLine });
-            }
-          }
-        }
-      }
-
-      const gState = socialV2.conversations.get(gKey);
-      const gRecent = Array.isArray(gState?.recentMessages) ? gState.recentMessages : [];
-      if (gRecent.length > 0) {
-        if (isExplicitGroupQuery) {
-          for (const m of gRecent.slice(-6)) {
-            if (!m) continue;
-            const txt = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-            if (txt) matchedLiveMsgs.push(`[群近期 ${localClockText(m.time)}] ${m.sender || m.userId}: ${txt}`);
-          }
-        } else {
-          for (const m of gRecent.slice(-30)) {
-            if (!m) continue;
-            const txt = String(m.plain || m.text || '').replace(/\s+/g, ' ').trim();
-            const sender = String(m.sender || '');
-            const combined = `${sender} ${txt}`.toLowerCase();
-            let msgScore = 0;
-            for (const ent of knownEntities) {
-              const entLower = ent.toLowerCase();
-              if (entLower.length >= 2 && qLower.includes(entLower) && combined.includes(entLower)) msgScore += 6;
-            }
-            for (const tok of asciiTokens) {
-              if (combined.includes(tok)) msgScore += 4;
-            }
-            for (const tg of cjkTrigrams) {
-              if (combined.includes(tg)) msgScore += 4;
-            }
-            let bgHits = 0;
-            for (const bg of cjkBigrams) {
-              if (combined.includes(bg)) bgHits += 1;
-            }
-            if (bgHits >= 2) msgScore += bgHits * 3;
-            if (msgScore >= 5) {
-              matchedLiveMsgs.push(`[群近期 ${localClockText(m.time)}] ${sender || m.userId}: ${txt.slice(0, 80)}`);
-            }
-          }
-        }
-      }
-
-      if (isExplicitGroupQuery && scoredLines.length === 0 && newestDiaryBullets.length > 0) {
-        for (const b of newestDiaryBullets) {
-          if (!seenLines.has(b)) {
-            seenLines.add(b);
-            scoredLines.push({ score: 3, text: b });
-          }
-        }
-      }
-    }
-
-    scoredLines.sort((a, b) => b.score - a.score);
-    const topBullets = scoredLines.slice(0, 5).map((x) => `- ${x.text}`);
-    const topLive = [...new Set(matchedLiveMsgs)].slice(-5).map((x) => `- ${x}`);
-    if (topBullets.length === 0 && topLive.length === 0) return '';
-    const combined = [...topBullets, ...topLive].join('\n').slice(0, 800);
-    return `\n【私聊按需巡回的群聊记忆与近期动态（仅当 Creator 问及或话题相关时按需回应，平时不主动硬扯）】\n${combined}`;
-  }
-
   function buildWakePromptV2(key, reason) {
     const roleState = readRoleState();
     const st = getSocialV2State(key);
-    maybeEnqueueMemoryArchiveV2(key, st);
+    const isPrivateProactive = String(key).startsWith('private:') && reason === 'proactiveCheck';
+    maybeEnqueueMemoryArchiveV2(key, st, isPrivateProactive
+      ? { force: true, minMessages: 5, triggerReason: 'proactiveCheck' }
+      : undefined);
     const isCompactWake = String(cfg.dsh?.baseUrl ?? '').startsWith('agy://') && reason !== 'bootstrap';
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12356,10 +11480,10 @@ async function main() {
         && /[画图绘改像表情]/.test(String(m.plain || m.text || '')));
       const hasVoiceReq = Array.isArray(st.unread) && st.unread.some((m) => /(?:语音|说话|开口|声音|叫一[声下]|听.*声|发条语音|念一[下遍]|tts)/i.test(String(m?.plain || m?.text || '')));
       const drawHint = hasCreatorDrawReq
-        ? '\n【外包画图提示】Creator 若让画图/改图，同命令加 --codex-draw "{\\"prompt\\":\\"详细描述\\",\\"selfRef\\":true}"（严禁用内置 generate_image）。'
+        ? '\n【外包画图提示】Creator 若让画图/改图，同命令直接加 --codex-draw "20岁成年7.5头身修长美少女Nya（黑短发深钴蓝挑染、青蓝眼、黑猫耳卫衣）的自然全身/半身日常插画描述"（自动启用 selfRef；严禁用内置 generate_image，严禁写错发色瞳色或局部特写）。'
         : '';
       const voiceHint = hasVoiceReq && voiceCfg().enabled && v2ToolEnabled('sendVoice') && ttsEnabled()
-        ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "要亲口说的短句台词" 发送真实 QQ 语音条（可单发 --tts 不带文字，或配文字一起发）！'
+        ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "[色っぽく艶のある甘い吐息交じりの声で、小悪魔っぽくからかうように] 日语タメ口短句（单条控制在15~38字以内，长句传多个 --tts 分句发送；耳语用 <whisper>...</whisper>、放软用 <soft>...</soft>）"，且【必须同时带上对应的中文文本消息】（严禁只发 --tts 不发中文文字）！'
         : '';
       const groupRecallHint = String(key ?? '').startsWith('private:')
         ? recallGroupMemoryForPrivateV2(key, st)
@@ -12802,10 +11926,21 @@ async function main() {
         }
       }
     };
+    api.onRecoverTurn = ({ sessionId, turn, workerId }, nextTurn) => {
+      const key = reverse.get(sessionId);
+      if (!key) return false;
+      const recovery = claims.transferSilentSlice(key, turn, nextTurn);
+      if (!recovery) return false;
+      memory.clearWorkerHotReloadSigsV2(workerId);
+      log('[reserved2] Worker ' + workerId + ' 重连，' + key + ' 切片 ' + turn
+        + (recovery === 'acknowledged' ? ' 已确认，关闭旧回合' : ' -> ' + nextTurn));
+      return recovery;
+    };
     api.onWorkerRotated = (wid) => {
       clearWorkerHotReloadSigsV2(wid);
       for (const [k, st] of socialV2.conversations.entries()) {
-        maybeEnqueueMemoryArchiveV2(k, st, { force: false, triggerReason: `rotate:${wid || 'worker'}` });
+        const isPriv = String(k).startsWith('private:');
+        maybeEnqueueMemoryArchiveV2(k, st, { force: isPriv, minMessages: isPriv ? 5 : 10, triggerReason: `rotate:${wid || 'worker'}` });
       }
     };
   }
@@ -12861,6 +11996,10 @@ async function main() {
     if (cfg.socialV2?.proactive?.enabled === false) return;
     if (socialV2.paused || currentMode !== 'reserved2') return;
     if (!isSessionAllowedInCurrentMode(key)) return;
+    if (String(key).startsWith('private:') && cfg.ownerQQ && key !== `private:${cfg.ownerQQ}`) {
+      const rawComp = cfg.persona?.memoryCompartments?.[String(key)];
+      if (rawComp?.proactive !== true) return;
+    }
     const st = getSocialV2State(key);
     if (st.proactiveTimer) return;
     const p = cfg.socialV2?.proactive ?? {};

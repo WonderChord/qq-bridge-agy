@@ -24,7 +24,9 @@ function parseArgs(argv) {
     sticker: null,
     image: null,
     tts: null,
+    ttsList: [],
     ttsProvider: null,
+    ttsRef: null,
     codexDraws: [],
     collectStickers: [],
     batch: null,
@@ -47,8 +49,15 @@ function parseArgs(argv) {
     else if (a === '--at' && i + 1 < argv.length) opts.at = argv[++i];
     else if (a === '--sticker' && i + 1 < argv.length) opts.sticker = argv[++i];
     else if (a === '--image' && i + 1 < argv.length) opts.image = argv[++i];
-    else if ((a === '--tts' || a === '--voice') && i + 1 < argv.length) opts.tts = String(argv[++i]).trim();
+    else if ((a === '--tts' || a === '--voice') && i + 1 < argv.length) {
+      const tVal = String(argv[++i]).trim();
+      if (tVal) {
+        opts.tts = tVal;
+        opts.ttsList.push(tVal);
+      }
+    }
     else if (a === '--tts-provider' && i + 1 < argv.length) opts.ttsProvider = String(argv[++i]).trim();
+    else if (a === '--tts-ref' && i + 1 < argv.length) opts.ttsRef = String(argv[++i]).trim();
     else if (a === '--codex-draw' && i + 1 < argv.length) opts.codexDraws.push(String(argv[++i]));
     else if (a === '--collect-sticker' && i + 1 < argv.length) opts.collectStickers.push(String(argv[++i]));
     else if (a === '--batch' && i + 1 < argv.length) opts.batch = argv[++i];
@@ -68,6 +77,7 @@ function parseArgs(argv) {
     opts.sticker = null;
     opts.image = null;
     opts.tts = null;
+    opts.ttsList = [];
     opts.codexDraws = [];
     opts.collectStickers = [];
   }
@@ -88,13 +98,143 @@ async function postBridge(port, consoleToken, agentToken, route, body) {
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data?.ok === false) {
-    throw new Error(`${route} failed (${res.status}): ${data?.error || JSON.stringify(data)}`);
+    throw Object.assign(new Error(`${route} failed (${res.status}): ${data?.error || JSON.stringify(data)}`), { status: res.status });
   }
   return data;
 }
 
-async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTurn, maxTurns) {
-  let finishFirst = true;
+async function sendWorkerText(port, consoleToken, token, payload) {
+  const send = (body) => postBridge(port, consoleToken, token, '/api/socialV2/send-message', body);
+  try {
+    return await send(payload);
+  } catch (err) {
+    if (!payload.replyToMessageId || err.status !== 400 || !/无法解析被引用消息|replyToMessageId 必须是非零整数/.test(err.message)) throw err;
+    const { replyToMessageId, ...plain } = payload;
+    return send(plain);
+  }
+}
+
+const POINT_TAGS_RE = /^\[(?:laughs|laughing|small laugh|chuckling|giggles|sighs|sighing|shaky breath|breath|gasps|gasping|panting|yawning|groaning|clears throat|clear throat|sobbing|short pause|long pause|break|long-break)\]$/i;
+
+function countSpokenChars(text) {
+  return String(text || '')
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/<[^>]*>/g, '')
+    .replace(/\s+/g, '')
+    .length;
+}
+
+// 自动将过长的单条 Drama 3 台词按气口/句号切分为多条精悍短句（每段约 18~42 个实际发音字符），
+// 既消除长句末端的声学飘逸，又显著提升首条语音到达的实时性，同时保持 <whisper>/<soft> 等尖括号闭合完整。
+export function splitLongDrama3Text(rawText, maxSpokenChars = 42) {
+  const s = String(rawText || '').trim();
+  if (!s) return [];
+  if (countSpokenChars(s) <= maxSpokenChars) return [s];
+
+  let leadingDir = '';
+  let body = s;
+  const leadMatch = /^(\[[^\]]+\])\s*([\s\S]*)$/.exec(s);
+  if (leadMatch && !POINT_TAGS_RE.test(leadMatch[1].trim())) {
+    leadingDir = leadMatch[1].trim();
+    body = leadMatch[2].trim();
+  }
+
+  const atoms = [];
+  let cur = '';
+  let bracketDepth = 0;
+  let spanDepth = 0;
+  for (let i = 0; i < body.length; i += 1) {
+    const rest = body.slice(i);
+    if (bracketDepth === 0 && spanDepth === 0) {
+      const pauseMatch = /^\[(?:short pause|long pause|break|long-break)\]\s*/i.exec(rest);
+      if (pauseMatch) {
+        if (cur.trim()) atoms.push(cur.trim());
+        cur = '';
+        i += pauseMatch[0].length - 1;
+        continue;
+      }
+    }
+    if (bracketDepth === 0 && rest[0] === '<') {
+      const closeMatch = /^<\/[a-z_]+>/i.exec(rest);
+      if (closeMatch) {
+        cur += closeMatch[0];
+        spanDepth = Math.max(0, spanDepth - 1);
+        i += closeMatch[0].length - 1;
+        if (spanDepth === 0 && /[。！？!?♪♥]\s*<\/[a-z_]+>$/i.test(cur)) {
+          if (cur.trim()) atoms.push(cur.trim());
+          cur = '';
+        }
+        continue;
+      }
+      const openMatch = /^<[a-z_]+>/i.exec(rest);
+      if (openMatch) {
+        cur += openMatch[0];
+        spanDepth += 1;
+        i += openMatch[0].length - 1;
+        continue;
+      }
+    }
+    const ch = body[i];
+    if (ch === '[') bracketDepth += 1;
+    else if (ch === ']' && bracketDepth > 0) bracketDepth -= 1;
+    cur += ch;
+    if (bracketDepth === 0 && spanDepth === 0 && /[。！？!?♪♥]/.test(ch)) {
+      const nextCh = body[i + 1] || '';
+      if (!/[。！？!?♪♥”’」』）\)]/.test(nextCh)) {
+        if (cur.trim()) atoms.push(cur.trim());
+        cur = '';
+      }
+    }
+  }
+  if (cur.trim()) atoms.push(cur.trim());
+
+  if (atoms.length <= 1) return [s];
+
+  const merged = [];
+  let acc = '';
+  for (const atom of atoms) {
+    if (!acc) {
+      acc = atom;
+      continue;
+    }
+    const accLen = countSpokenChars(acc);
+    const atomLen = countSpokenChars(atom);
+    if (accLen < 15 || (accLen + atomLen <= maxSpokenChars)) {
+      acc = `${acc} ${atom}`;
+    } else {
+      merged.push(acc);
+      acc = atom;
+    }
+  }
+  if (acc) {
+    if (merged.length > 0 && countSpokenChars(acc) < 12) {
+      merged[merged.length - 1] = `${merged[merged.length - 1]} ${acc}`;
+    } else {
+      merged.push(acc);
+    }
+  }
+
+  return merged.map((seg) => {
+    const trimmed = seg.trim();
+    if (!leadingDir) return trimmed;
+    const firstTag = /^(\[[^\]]+\])/.exec(trimmed);
+    if (firstTag && !POINT_TAGS_RE.test(firstTag[1])) return trimmed;
+    return `${leadingDir} ${trimmed}`;
+  });
+}
+
+function expandTtsSegments(rawInput) {
+  const list = Array.isArray(rawInput) ? rawInput : (rawInput ? [rawInput] : []);
+  const out = [];
+  for (const item of list) {
+    for (const seg of splitLongDrama3Text(item, 42)) {
+      if (seg) out.push(seg);
+    }
+  }
+  return out;
+}
+
+async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTurn, maxTurns, finishFirst = true) {
   const effectiveMaxTurns = Number.isFinite(maxTurns)
     ? maxTurns
     : (workerId !== 'primary' ? 25 : 0);
@@ -158,13 +298,16 @@ async function main() {
       if (claim.duplicate) {
         console.log('[agy-reply-and-wait] 此回合已有回复任务，重复调用已忽略。');
         if (!opts.noWait) {
-          await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, finishTurnForWait, opts.maxTurns);
+          await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false);
         }
         return;
       }
     } catch (err) {
-      console.error(`[agy-reply-and-wait] claim 警告 (${err?.message ?? err})，降级为无 turn 直发并继续监听`);
-      opts.finishTurn = '';
+      // 旧 turn 或未确认的 claim 绝不能降级为不带 turn 的 QQ 发送。
+      console.error('[agy-reply-and-wait] 未取得回合，跳过发送：' + err.message);
+      if (!opts.noWait) await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false);
+      else if (err.status !== 404 && err.status !== 409) process.exitCode = 1;
+      return;
     }
   }
   let failed = false;
@@ -239,20 +382,10 @@ async function main() {
             if (item.reply) payload.replyToMessageId = String(item.reply);
             if (item.at) payload.atUserId = String(item.at);
             try {
-              await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
+              await sendWorkerText(port, consoleToken, opts.token, payload);
             } catch (err) {
-              if (payload.replyToMessageId && String(err?.message ?? '').includes('无法解析被引用消息')) {
-                delete payload.replyToMessageId;
-                try {
-                  await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
-                } catch (err2) {
-                  failed = true;
-                  console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err2?.message ?? err2}`);
-                }
-              } else {
-                failed = true;
-                console.error(`[agy-reply-and-wait] 批量文本发送警告: ${err?.message ?? err}`);
-              }
+              failed = true;
+              console.error('[agy-reply-and-wait] 批量文本发送警告: ' + err.message);
             }
           }
           if (item.sticker) {
@@ -278,14 +411,18 @@ async function main() {
             }
           }
           if (item.tts || item.voice) {
-            const tp = { key: opts.key, text: String(item.tts || item.voice) };
-            if (opts.finishTurn) tp.turn = opts.finishTurn;
-            if (item.ttsProvider || opts.ttsProvider) tp.provider = String(item.ttsProvider || opts.ttsProvider);
-            try {
-              await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
-            } catch (err) {
-              failed = true;
-              console.error(`[agy-reply-and-wait] 批量语音发送警告: ${err?.message ?? err}`);
+            const ttsSegments = expandTtsSegments(item.tts || item.voice);
+            for (const segText of ttsSegments) {
+              const tp = { key: opts.key, text: String(segText) };
+              if (opts.finishTurn) tp.turn = opts.finishTurn;
+              if (item.ttsProvider || opts.ttsProvider) tp.provider = String(item.ttsProvider || opts.ttsProvider);
+              if (item.ttsRef || opts.ttsRef) tp.ttsRef = String(item.ttsRef || opts.ttsRef);
+              try {
+                await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
+              } catch (err) {
+                failed = true;
+                console.error(`[agy-reply-and-wait] 批量语音发送警告: ${err?.message ?? err}`);
+              }
             }
           }
         }
@@ -301,20 +438,10 @@ async function main() {
       if (opts.reply) payload.replyToMessageId = opts.reply;
       if (opts.at) payload.atUserId = opts.at;
       try {
-        await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
+        await sendWorkerText(port, consoleToken, opts.token, payload);
       } catch (err) {
-        if (payload.replyToMessageId && String(err?.message ?? '').includes('无法解析被引用消息')) {
-          delete payload.replyToMessageId;
-          try {
-            await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-message', payload);
-          } catch (err2) {
-            failed = true;
-            console.error(`[agy-reply-and-wait] 文本发送警告: ${err2?.message ?? err2}`);
-          }
-        } else {
-          failed = true;
-          console.error(`[agy-reply-and-wait] 文本发送警告: ${err?.message ?? err}`);
-        }
+        failed = true;
+        console.error('[agy-reply-and-wait] 文本发送警告: ' + err.message);
       }
     }
     if (opts.sticker) {
@@ -339,9 +466,11 @@ async function main() {
         console.error(`[agy-reply-and-wait] 图片发送警告: ${err?.message ?? err}`);
       }
     }
-    if (opts.tts) {
-      const tp = { key: opts.key, text: String(opts.tts) };
+    const allTtsSegments = expandTtsSegments(opts.ttsList.length > 0 ? opts.ttsList : opts.tts);
+    for (const segText of allTtsSegments) {
+      const tp = { key: opts.key, text: String(segText) };
       if (opts.ttsProvider) tp.provider = String(opts.ttsProvider);
+      if (opts.ttsRef) tp.ttsRef = String(opts.ttsRef);
       if (opts.finishTurn) tp.turn = opts.finishTurn;
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);

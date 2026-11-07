@@ -132,23 +132,19 @@ test('删掉安全不变量或正文过短时阻断保存（保护 AI 效果与�
   assert.deepEqual(clean, [], `内置提示词不应有阻断项，实际：${clean.join('；')}`);
 });
 
-test('写回沿用文件主导行尾，且不吞掉块尾空行', () => {
-  const next = renderPresetPromptYaml(source, originalPrefix);
-  const crlf = (next.match(/\r\n/g) ?? []).length;
-  const lfOnly = (next.match(/\n/g) ?? []).length - crlf;
-  assert.ok(crlf > 0, 'CRLF 文件写回后应仍使用 CRLF');
-  assert.equal(lfOnly, 0, '写回后不应残留/新增 LF-only 行');
-  assert.ok(next.includes('prefix: |-\r\n'), '新增行应使用 CRLF');
-  // 块之后的内容（空行、注释、后续条目）必须逐字保留
-  const before = locatePresetPromptBlock(source);
-  const after = locatePresetPromptBlock(next);
-  assert.deepEqual(
-    next.split('\n').slice(after.blockEnd),
-    source.split('\n').slice(before.blockEnd),
-    'prefix 块之后的内容应逐字不变（含块尾空行与注释）',
-  );
-  assert.ok(source.split('\n').slice(before.blockEnd).some((l) => l.trim() === ''), '样本应确实包含块尾空行，否则该断言无意义');
-});
+for (const eol of ['\r\n', '\n']) {
+  test('写回沿用 ' + (eol.length === 2 ? 'CRLF' : 'LF') + '，且不吞掉块尾空行', () => {
+    const original = source.replace(/\r?\n/g, eol);
+    const next = renderPresetPromptYaml(original, originalPrefix);
+    assert.ok(next.includes('prefix: |-' + eol));
+    assert.equal(next.replaceAll(eol, '').includes('\n'), false, '不得混入裸 LF');
+    if (eol === '\n') assert.equal(next.includes('\r'), false);
+    const before = locatePresetPromptBlock(original);
+    const after = locatePresetPromptBlock(next);
+    assert.deepEqual(next.split('\n').slice(after.blockEnd), original.split('\n').slice(before.blockEnd));
+    assert.ok(original.split('\n').slice(before.blockEnd).some((l) => l.trim() === ''), '样本须包含块尾空行');
+  });
+}
 
 test('只含空格/Tab 的行也能安全往返（不会被当成空行读丢）', () => {
   const spaced = [

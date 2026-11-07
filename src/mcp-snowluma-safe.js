@@ -1197,22 +1197,39 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
   server.tool(
     'qq_send_voice',
-    '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
+    '在指定会话发一条 QQ 语音。支持两种用法：① Drama 3 实时语音合成（推荐）：传 text（支持 Fish Audio Drama 3 的 [...] 演技指令、音效停顿与 <whisper>...</whisper> / <soft>...</soft> 等成对尖括号标签，自动匹配 48kHz 天童爱丽丝参考声源）；② 发送语音库预置音频：传 voice（来自 qq_list_voices 的文件名）。返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）。',
     {
       key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
       token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
-      voice: z.string().describe('语音库里的文件名（来自 qq_list_voices 的 name，可带子目录/可省略扩展名）'),
+      text: z.string().optional().describe('可选：用 Fish Audio Drama 3（天童爱丽丝声线）实时合成并发送的台词（支持 [...] 演技指令与 <whisper>...</whisper> 等成对标签）'),
+      ttsRef: z.string().optional().describe('可选：指定爱丽丝 48kHz 参考音情绪档位（01_default / 02_tsukkomi / 03_nadenade / 04_shy / 05_happy_clingy / 06_smug_gamer，不填则按台词标签智能匹配）'),
+      voice: z.string().optional().describe('可选：语音库里的静态文件名（来自 qq_list_voices 的 name，若传了 text 则优先走 TTS 合成）'),
       label: z.string().optional().describe('可选：写进会话记录里的说明，如「说了句晚安」'),
       verify: z.boolean().optional().describe('是否回读校验语音已落地（默认 true，建议保持开启）'),
       readback: z.boolean().optional().describe('是否额外索取 QQ 转写文本（自己发的语音通常没有，默认 false）')
     },
-    async ({ key, token, voice, label, verify, readback }) => {
+    async ({ key, token, text, ttsRef, voice, label, verify, readback }) => {
       try {
+        if (text && String(text).trim()) {
+          const data = await agentApi('/api/socialV2/send-tts', {
+            method: 'POST',
+            body: JSON.stringify({
+              key,
+              text: String(text).trim(),
+              ...(ttsRef ? { ttsRef: String(ttsRef).trim() } : {}),
+              verify: verify !== false,
+              token
+            }),
+            headers: { 'x-agent-token': token },
+            timeoutMs: 300000
+          });
+          return { content: [{ type: 'text', text: serializeModelData(data) }] };
+        }
         const data = await agentApi('/api/socialV2/send-voice', {
           method: 'POST',
           body: JSON.stringify({
             key,
-            voice: String(voice),
+            voice: String(voice || ''),
             label: label || '',
             verify: verify !== false,
             readback: readback === true,
