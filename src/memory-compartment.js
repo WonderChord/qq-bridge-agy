@@ -91,7 +91,7 @@ export function createMemoryCompartments({
         return {
           seq: m.seq ?? null,
           at: m.time ? localClockText(m.time) : '',
-          sender: isCreator ? `[Creator/墨宝] ${baseSender}` : baseSender,
+          sender: isCreator ? `[Creator] ${baseSender}` : baseSender,
           userId: uid,
           text: String(m.text || m.plain || '').slice(0, maxTextLen),
         };
@@ -370,7 +370,7 @@ export function createMemoryCompartments({
         const combinedMemSig = `${ownMtime}:${privMtime}`;
         if (agyLastMemSig.get(slotKey) !== combinedMemSig) {
           if (hasOwnMem) {
-            const maxOwnChars = isGroupKey ? 7500 : 4800;
+            const maxOwnChars = isGroupKey ? 7500 : 6500;
             const memText = fs.readFileSync(comp.summaryPath, 'utf8').trim().slice(0, maxOwnChars);
             if (memText) {
               const title = isGroupKey
@@ -429,8 +429,29 @@ export function createMemoryCompartments({
     if (!query || PRIVATE_RECALL_STOPWORDS.has(query)) return '';
     const terms = recallTerms(query);
     const explicit = /(?:群里|海沟|higo|群友|水群|那群人|那帮人|他们.*聊|都在聊|群.*聊|在群|群动态)/i.test(query);
+    const privExplicit = /(?:上次|之前|那次|昨晚|昨天|前天|周末|周六|周日|傍晚|日记|记得|约定|当时)/i.test(query);
     const groups = Object.entries(personaCfg().memoryCompartments || {}).filter(([key, comp]) => key.startsWith('group:') && comp?.dir);
-    recallIndex.retain(groups.map(([key]) => key));
+    recallIndex.retain([...groups.map(([k]) => k), key]);
+    const privBullets = [];
+    const privComp = MEMORY_COMPARTMENTS[key];
+    if (privComp?.diaryDir) {
+      try {
+        const pIndex = recallIndex.load(key, privComp);
+        const pMatches = matchingEntities(query, pIndex.entities);
+        for (const { tag, date, lines } of pIndex.sources) {
+          if (tag === '常驻' || tag === '百字档案') continue;
+          const ageDays = date == null ? Infinity : Math.max(0, (Date.now() - date) / 86_400_000);
+          const recency = 1 / (1 + ageDays / 14);
+          for (const line of lines) {
+            const sc = scoreRecall(line, terms, pMatches, privExplicit);
+            if (sc >= 4) {
+              privBullets.push({ score: sc + recency, text: `[私聊日记 ${tag}.md] ${line.slice(0, 260)}` });
+            }
+          }
+        }
+        privBullets.sort((a, b) => b.score - a.score);
+      } catch {}
+    }
     const bullets = [];
     const live = [];
     for (const [gKey, raw] of groups) {
@@ -470,11 +491,21 @@ export function createMemoryCompartments({
     }
     bullets.sort((a, b) => b.score - a.score);
     live.sort((a, b) => b.score - a.score || b.time - a.time);
-    const top = (hits) => [...new Set(hits.map((hit) => hit.text))].slice(0, 5);
-    const entries = [...top(bullets), ...top(live)];
-    if (!entries.length) return '';
-    const heading = '\n【私聊按需巡回的群聊记忆与近期动态（仅当 Creator 问及或话题相关时按需回应，平时不主动硬扯）】\n';
-    return (heading + entries.map((line) => '- ' + line).join('\n')).slice(0, 800);
+    const top = (hits, n = 5) => [...new Set(hits.map((hit) => hit.text))].slice(0, n);
+    let out = '';
+    const topPriv = top(privBullets, 4);
+    if (topPriv.length) {
+      const diaryPathHint = privComp?.diaryDir ? privComp.diaryDir.replace(/\\/g, '/') : 'memory/creator_private/diary';
+      out += `\n【私聊历史日记按需巡回（如需完整翻看整篇日记细节，可先 view_file 读取 "${diaryPathHint}/<日期>.md"）】\n`
+        + topPriv.map((line) => '- ' + line).join('\n')
+        + '\n';
+    }
+    const entries = [...top(bullets, 5), ...top(live, 5)];
+    if (entries.length) {
+      const heading = '\n【私聊按需巡回的群聊记忆与近期动态（仅当 Creator 问及或话题相关时按需回应，平时不主动硬扯）】\n';
+      out += (heading + entries.map((line) => '- ' + line).join('\n')).slice(0, 800);
+    }
+    return out;
   }
 
   return {

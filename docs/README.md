@@ -3,7 +3,7 @@
 | 用途 | 入口 |
 | --- | --- |
 | 安装依赖、选择后端、填写白名单 | [项目说明](../README.md) |
-| 配置 Antigravity、NapCat 守护、人设与长期记忆 | [Antigravity 后端](guides/ANTIGRAVITY.md) |
+| 配置 Antigravity、NapCat 守护、人设与长期记忆 | [Antigravity 后端](guides/ANTIGRAVITY.md)、[群友人设总结与双层记忆归档指南](guides/MEMORY_ARCHIVE_GUIDE.md) |
 | 安装 DSH 的 QQ preset 与 MCP | [DSH 安装](guides/DSH_SETUP.md) |
 | 核对 DSH 协议与版本 | [0.2.0 适配](guides/DSH_020_ADAPTATION.md)、[0.2.1 适配](guides/DSH_021_ADAPTATION.md) |
 | 配置语音库、TTS 与可选独立工具 | [QQ 语音](guides/QQ_VOICE.md)、[Fish Audio Drama 3 高表现力 TTS 指南](guides/FISH_DRAMA3_TTS_GUIDE.md) |
