@@ -14,9 +14,9 @@
 | **L2 群友深度详档** | `people.md` | 每人 `200~350` 字 | 按未读发言人/昵称/关键词动态打分巡回，每轮最多挂载 4 人（12 轮冷却） | 每位常驻群友的**详细装备拓扑、专业背景、人际交集约定与历史名场面** |
 | **L3 历史事件日记** | `diary/YYYY-MM-DD.md` | 按日追加 | 命中未读话题关键词（`score >= 6`）时自动抽取 Top 3 条目 | 按日期归档的高价值群内事件、面基/联机记录、群友约定与名场面 |
 
-### 单向隐私隔离原则
-- **群聊 Worker**（当 `includePrivate: true` 时）可单向只读挂载 Creator 私聊摘要（`owner.md`，截取前 `3400` 字），保证群内与 Creator 互动时默契不断档，但严禁向群友外泄私密细节。
-- **私聊 Worker** 默认只读 `creator_private/owner.md`（`<= 6500` 字），仅当 Creator 来信提及群聊、特定群友昵称或历史时间词时，才由 `recallGroupMemoryForPrivateV2` 按需检索群聊记忆与历史日记。
+### 单向隐私隔离与私聊多层沉淀原则
+- **群聊 Worker**（当 `includePrivate: true` 时）可单向只读挂载 Creator 私聊摘要（`owner.md`，截取前 `6000` 字），保证群内与 Creator 互动时默契不断档，但严禁向群友外泄私密细节。
+- **私聊 Worker** 常驻挂载 `owner.md`（默认上限 `10000` 字，`8500` 字触发容量预警）及可选专项账本 `ledger.md`；当 `owner.md` 接近容量上限时，归档员先将早期详细经过无损沉淀为 `event_book.md` 的结构化 `### [EVT-xx | 日期] 标题` 条目，再精炼常驻主档。私聊唤醒时同时支持从 `event_book.md`、近 30 日历史日记与群聊记忆中按关键词动态打分巡回。
 
 ---
 
@@ -83,5 +83,5 @@
 
 ## 四、旁路异步归档工作流（零阻塞）
 
-1. **触发条件**：当某群聊或私聊自上次归档以来新增消息达到阈值（默认 `archiveEveryMessages: 60`）且距离上次归档超过冷却时间（默认 `archiveMinIntervalMs: 3600000`），`maybeEnqueueMemoryArchiveV2` 自动将批次推入后台队列。
-2. **消费归档**：后台 `qq-memory-archivist` 子代理通过 `node scripts/agy-wait-archive.mjs` 阻塞式长轮询领取任务，按重要性过滤法则同步更新 `summary.md`、`people.md` 与 `diary/YYYY-MM-DD.md`，随后回传 `--done-id` 完成闭环，全程对主聊天线程零阻塞。
+1. **触发条件**：当某群聊（默认 `threshold: 200`）或私聊（默认 `threshold: 35`）新增消息达到阈值，或 Worker 满轮换新达到最小归档条数（私聊 `25` 条 / 群聊 `80` 条）时，`maybeEnqueueMemoryArchiveV2` 自动过滤掉机器人自身的 `[语音]` 回显气泡并将批次推入后台队列。
+2. **消费归档与满 4 批强制换新**：后台 `qq-memory-archivist` 子代理通过 `node scripts/agy-wait-archive.mjs` 阻塞式长轮询领取任务，按重要性过滤法则更新 `summary.md` / `owner.md`、`event_book.md`、`people.md` 与单日文件 `diary/YYYY-MM-DD.md`；每累计完成 **4 批**归档自动输出 `=== ARCHIVE_ROTATE_NEEDED ===` 请求总控换新清零上下文，防止长间隔唤醒反复全价重读历史上下文。

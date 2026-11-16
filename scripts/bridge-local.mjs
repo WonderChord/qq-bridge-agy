@@ -8,6 +8,14 @@ export function loadConfig() {
   return JSON.parse(fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8').replace(/^\uFEFF/, ''));
 }
 
+export function readStudioRelay() {
+  const cfgAll = loadConfig(); const dir = String(process.env.STUDIO_RELAY_DIR || cfgAll.studioRelay?.dir || '').trim(); if (!dir) throw new Error('未配置 studioRelay.dir 或 STUDIO_RELAY_DIR');
+  const config = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8').replace(/^\uFEFF/, ''));
+  const port = Number(config.port) || 8788;
+  const key = fs.readFileSync(path.resolve(dir, config.localKeyFile || 'cloud-auth/relay.key'), 'utf8').trim();
+  return { port, baseUrl: `http://127.0.0.1:${port}`, key };
+}
+
 export function readConsoleToken(config = loadConfig()) {
   const configured = String(config.consoleToken ?? '').trim();
   if (/^[A-Za-z0-9_-]{16,128}$/.test(configured)) return configured;

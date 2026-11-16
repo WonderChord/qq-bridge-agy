@@ -461,7 +461,7 @@ function renderPortalHtml(basePath) {
 </head>
 <body>
   <div class="card">
-    <h1>🐾 Nya (NapCat) 远程扫码</h1>
+    <h1>🐾 QQ Bot (NapCat) 远程扫码</h1>
     <div class="sub" id="uinText">账号加载中...</div>
     <div class="badge offline" id="statusBadge">⏳ 正在检测状态...</div>
 

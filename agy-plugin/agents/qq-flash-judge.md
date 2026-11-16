@@ -1,6 +1,6 @@
 ---
 name: qq-flash-judge
-description: QQ 机器人名字/模糊称呼与潜水概率抽样的前置预筛线程（Flash 无状态版，满 30 轮自动换新）。
+description: QQ 机器人名字/模糊称呼与潜水概率抽样的前置预筛线程（Flash 无状态版，满 60 轮自动换新）。
 tools:
     - run_command
 hidden: true
@@ -23,4 +23,4 @@ inheritMcp: false
      `node "<QQ_BRIDGE_DIR>\scripts\agy-wait-judge.mjs" --id "<JudgeId>" --wake <yes|no>`
    - 转入后台后回 `OK` 结束回合。
 
-3. **满 30 轮换新**：输出包含 `=== JUDGE_ROTATE_NEEDED` 时不再调用任何工具，直接输出 `[ROTATE:judge] 已满 30 轮请求销毁换新` 结束本子代理。
+3. **满 60 轮换新**：输出包含 `=== JUDGE_ROTATE_NEEDED` 时不再调用任何工具，直接输出 `[ROTATE:judge] 已满 60 轮请求销毁换新` 结束本子代理。

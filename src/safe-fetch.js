@@ -150,10 +150,12 @@ export async function resolveSafeAddresses(hostname) {
     throw new Error(`域名解析失败：${error?.message ?? error}`);
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
-  const isTrustedQqMediaHost = /(^|\.)(qq\.com|qq\.com\.cn|qpic\.cn|gtimg\.cn)$/i.test(h);
   const isTunFakeIp = (addr) => /^198\.(18|19)\.\d+\.\d+$/.test(String(addr || ''));
   for (const { address } of addresses) {
-    if (isTrustedQqMediaHost && isTunFakeIp(address)) continue;
+    // 兼容本机开启 Clash / Sing-box / Mihomo TUN 虚拟网卡时的 Fake-IP (198.18.0.0/15)：
+    // validateFetchUrl 与 resolveSafeAddresses 已经在前面拒绝了字面量 IP 请求和 localhost/.local，
+    // 只有真实外部公网域名经系统 DNS 解析出 198.18.x.x 时才是 TUN 透明代理分配的 Fake-IP。
+    if (isTunFakeIp(address)) continue;
     if (isPrivateIp(address)) {
       throw new Error('域名解析到内网/本机地址，已阻止');
     }

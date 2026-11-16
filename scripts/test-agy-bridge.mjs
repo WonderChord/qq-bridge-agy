@@ -340,16 +340,19 @@ test('seq 与字符串 messageId 分别命中 recentMessages 和 unread，不请
 });
 
 // 在临时配置目录运行发布的脚本，让 stdout、退出码及重新长轮询也进入测试。
-async function runWorker(h, args) {
+async function runWorker(h, args, stdin) {
   const folder = path.join(h.temp, 'scripts');
   fs.mkdirSync(folder, { recursive: true });
   for (const name of ['bridge-local.mjs', 'agy-reply-and-wait.mjs']) {
     fs.copyFileSync(new URL('./' + name, import.meta.url), path.join(folder, name));
   }
+  fs.copyFileSync(new URL('../src/tts.js', import.meta.url), path.join(h.temp, 'src', 'tts.js'));
   const config = path.join(h.temp, 'config.json');
   fs.writeFileSync(config, JSON.stringify({ ...JSON.parse(fs.readFileSync(config)), consolePort: h.port }));
-  return promisify(execFile)(process.execPath, [path.join(folder, 'agy-reply-and-wait.mjs'), '--worker-id', 'w1', ...args],
+  const result = promisify(execFile)(process.execPath, [path.join(folder, 'agy-reply-and-wait.mjs'), '--worker-id', 'w1', ...args],
     { timeout: 10000, windowsHide: true, env: { ...process.env, NO_PROXY: 'localhost,127.0.0.1', NODE_USE_ENV_PROXY: '0' } });
+  result.child.stdin.end(stdin);
+  return result;
 }
 
 test('真实 Worker 的单条与 batch 引用 400 都会降级，只发一次纯文本', async (t) => {
@@ -364,6 +367,23 @@ test('真实 Worker 的单条与 batch 引用 400 都会降级，只发一次纯
     assert.equal(sent.length, i + 1);
     assert.deepEqual(sent.at(-1).body.message, [{ type: 'text', data: { text: ['第一条正文', '第二条正文'][i] } }]);
   }
+});
+
+test('Worker 批量标准输入保留中文和 JSON 引号，格式错误时保留原回合', async (t) => {
+  const h = await fixture(t, agy);
+  say(h, groupA, '观测员', '触发', 970);
+  const w = await wake(h, groupA);
+  const args = ['--key', groupA, '--token', w.agentToken, '--seq', '1', '--finish-turn', w.turn, '--no-wait', '--batch-stdin'];
+  const sends = () => h.calls.http.filter(call => call.url.endsWith('/send_group_msg'));
+  await assert.rejects(runWorker(h, args, '[{reply:970,messages:[测试]}]'), { code: 1 });
+  assert.equal(h.api.activeTurnCount(), 1);
+  assert.equal(sends().length, 0);
+
+  const reply = '中文测试：他说 "好"，然后换行\n继续。';
+  await runWorker(h, args, JSON.stringify([{ reply: '970', messages: [reply] }]));
+  assert.equal(sends().length, 1);
+  assert.ok(sends()[0].body.message.some(part => part.type === 'text' && part.data.text === reply));
+  assert.equal(h.api.activeTurnCount(), 0);
 });
 
 test('同一 Worker 重挂取回原切片，拒绝旧 ID，保留其它 Worker 的切片及已发言回合', async (t) => {
@@ -389,7 +409,7 @@ test('同一 Worker 重挂取回原切片，拒绝旧 ID，保留其它 Worker �
   const status = (await h.request('/api/agy/status')).data;
   const health = status.workers.find((w) => w.workerId === 'w1');
   assert.ok(Date.parse(health.connectedAt) && Date.parse(health.lastWakeAt));
-  assert.match(status.loadedSignatures.find((s) => s.workerId === 'w1' && s.key === groupA).memory, /^[\d.]+:[\d.]+$/);
+  assert.match(status.loadedSignatures.find((s) => s.workerId === 'w1' && s.key === groupA).memory, /^[\d.]+(?::[\d.]+){1,2}$/);
   assert.doesNotMatch(JSON.stringify(status), /原始切片|私聊专属约定/);
   const afterSpeech = await h.request('/api/agy/wait?workerId=w1&timeoutMs=1000');
   assert.ok(afterSpeech.data.timedOut, '已发言的回合不能重投');
@@ -409,7 +429,7 @@ test('陈旧 claim 回到监听，既不发送旧消息也不确认下一轮的�
   const token = h.getSocialV2State(groupA).agentToken;
   const cli = await runWorker(h, ['--key', groupA, '--token', token, '--finish-turn', 'stale', '--seq', '1', '过期正文']);
   assert.match(cli.stdout, /QQ 唤醒/);
-  assert.deepEqual(h.responses.map(([url]) => url.split('?')[0]), ['/api/agy/claim', '/api/agy/wait']);
+  assert.deepEqual(h.responses.map(([url]) => url.split('?')[0]), ['/api/agy/claim', '/api/agy/wait', '/api/socialV2/recent']);
   assert.equal(h.calls.http.filter((call) => call.url.endsWith('/send_group_msg')).length, 0);
   assert.equal(h.getSocialV2State(groupA).unread.length, 1);
 });

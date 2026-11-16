@@ -19,11 +19,18 @@ export function createMemoryCompartments({
       const raw = personaCfg().memoryCompartments?.[String(key)];
       if (!raw || typeof raw !== 'object' || !raw.dir) return undefined;
       const dir = path.resolve(root, String(raw.dir));
+      const isGroup = String(key).startsWith('group:');
       return {
         summaryPath: path.join(dir, String(raw.summaryFile || 'summary.md')),
         peoplePath: path.join(dir, String(raw.peopleFile || 'people.md')),
+        intimatePath: path.join(dir, String(raw.ledgerFile || 'ledger.md')),
+        eventBookPath: path.join(dir, String(raw.eventBookFile || 'event_book.md')),
         diaryDir: path.join(dir, 'diary'),
-        threshold: Math.max(5, Number(raw.threshold) || (String(key).startsWith('group:') ? 150 : 15)),
+        maxChars: Math.max(2000, Number(raw.maxChars) || (isGroup ? 8500 : 10000)),
+        warnChars: Math.max(1500, Number(raw.warnChars) || (isGroup ? 7600 : 8500)),
+        intimateMaxChars: Math.max(2000, Number(raw.intimateMaxChars) || 6000),
+        intimateWarnChars: Math.max(1500, Number(raw.intimateWarnChars) || 5000),
+        threshold: Math.max(5, Number(raw.threshold) || (isGroup ? 150 : 15)),
       };
     }
   });
@@ -66,6 +73,17 @@ export function createMemoryCompartments({
     }
     const prevSeq = lastArchivedSeqByKey.get(key) || 0;
     const delta = latestSeq - prevSeq;
+    let summaryLen = 0;
+    let intimateLen = 0;
+    try {
+      if (comp.summaryPath && fs.existsSync(comp.summaryPath)) {
+        summaryLen = fs.readFileSync(comp.summaryPath, 'utf8').trim().length;
+      }
+      if (!isGroupKey && comp.intimatePath && fs.existsSync(comp.intimatePath)) {
+        intimateLen = fs.readFileSync(comp.intimatePath, 'utf8').trim().length;
+      }
+    } catch {}
+    const quotaWarning = (summaryLen >= comp.warnChars) || (!isGroupKey && intimateLen >= comp.intimateWarnChars);
     const defaultMin = isGroupKey ? 10 : 5;
     const requiredDelta = force ? Math.max(1, Number(minMessages) || defaultMin) : comp.threshold;
     if (delta < requiredDelta) return;
@@ -80,6 +98,7 @@ export function createMemoryCompartments({
     const batch = recent
       .filter((m) => {
         if (!m) return false;
+        if (m.isSelf && /^\[语音/.test(String(m.text || m.plain || ''))) return false;
         if (Number.isSafeInteger(m.seq)) return m.seq > prevSeq;
         return m.isSelf && minSelfTime > 0 && Number(m.time || 0) >= minSelfTime;
       })
@@ -102,12 +121,21 @@ export function createMemoryCompartments({
     const job = {
       id: `archive-${++memoryArchiveCounter}`,
       key,
-      triggerReason,
+      triggerReason: quotaWarning ? `${triggerReason}+quota_warn` : triggerReason,
       fromSeq: prevSeq + 1,
       toSeq: latestSeq,
       summaryPath: comp.summaryPath.replace(/\\/g, '/'),
       peoplePath: comp.peoplePath.replace(/\\/g, '/'),
+      intimatePath: comp.intimatePath ? comp.intimatePath.replace(/\\/g, '/') : '',
+      eventBookPath: comp.eventBookPath ? comp.eventBookPath.replace(/\\/g, '/') : '',
       diaryDir: comp.diaryDir.replace(/\\/g, '/'),
+      maxChars: comp.maxChars,
+      warnChars: comp.warnChars,
+      intimateMaxChars: comp.intimateMaxChars,
+      intimateWarnChars: comp.intimateWarnChars,
+      summaryLen,
+      intimateLen,
+      quotaWarning,
       messages: batch,
       createdAt: new Date().toISOString(),
     };
@@ -362,25 +390,36 @@ export function createMemoryCompartments({
         })())
       : undefined;
     const hasOwnMem = Boolean(comp && fs.existsSync(comp.summaryPath));
+    const hasIntimateMem = Boolean(!isGroupKey && comp?.intimatePath && fs.existsSync(comp.intimatePath));
     const hasPrivMem = Boolean(privComp && privComp.summaryPath !== comp?.summaryPath && fs.existsSync(privComp.summaryPath));
-    if (hasOwnMem || hasPrivMem) {
+    if (hasOwnMem || hasIntimateMem || hasPrivMem) {
       try {
         const ownMtime = hasOwnMem ? String(fs.statSync(comp.summaryPath).mtimeMs) : '0';
+        const intimateMtime = hasIntimateMem ? String(fs.statSync(comp.intimatePath).mtimeMs) : '0';
         const privMtime = hasPrivMem ? String(fs.statSync(privComp.summaryPath).mtimeMs) : '0';
-        const combinedMemSig = `${ownMtime}:${privMtime}`;
+        const combinedMemSig = `${ownMtime}:${intimateMtime}:${privMtime}`;
         if (agyLastMemSig.get(slotKey) !== combinedMemSig) {
           if (hasOwnMem) {
-            const maxOwnChars = isGroupKey ? 7500 : 6500;
-            const memText = fs.readFileSync(comp.summaryPath, 'utf8').trim().slice(0, maxOwnChars);
+            const maxOwnChars = comp?.maxChars || (isGroupKey ? 7500 : 10000);
+            const rawOwn = fs.readFileSync(comp.summaryPath, 'utf8').trim();
+            const memText = rawOwn.slice(0, maxOwnChars);
             if (memText) {
+              const quotaInfo = `${rawOwn.length}/${maxOwnChars} 字${rawOwn.length >= (comp?.warnChars || 8500) ? ' ⚠️接近上限，归档员将在下轮自动无损压缩并沉淀至 event_book.md' : ''}`;
               const title = isGroupKey
-                ? `【本群日常常驻记忆（含群总纲、Creator画像及全员百字设定，仅限 ${key} 使用）】`
-                : `【本会话分舱长期记忆精华（Creator 私聊记忆）】`;
+                ? `【本群日常常驻记忆（含群总纲、Creator画像及全员百字设定，仅限 ${key} 使用 | 额度 ${quotaInfo}）】`
+                : `【本会话分舱长期记忆精华（Creator 私聊记忆 10K 扩容版 | 额度 ${quotaInfo}）】`;
               prefix += `${title}\n${memText}\n\n`;
             }
           }
+          if (hasIntimateMem) {
+            const maxIntimate = comp?.intimateMaxChars || 6000;
+            const intimateText = fs.readFileSync(comp.intimatePath, 'utf8').trim().slice(0, maxIntimate);
+            if (intimateText) {
+              prefix += `【本会话专项补充账本与统计（ledger.md）】\n${intimateText}\n\n`;
+            }
+          }
           if (hasPrivMem) {
-            const privText = fs.readFileSync(privComp.summaryPath, 'utf8').trim().slice(0, 3400);
+            const privText = fs.readFileSync(privComp.summaryPath, 'utf8').trim().slice(0, 6000);
             if (privText) {
               prefix += `【单向挂载：Creator 私聊长期记忆（群内与 Creator 互动时共享默契背景，但私密细节勿向无关群友外泄）】\n${privText}\n\n`;
             }
@@ -429,9 +468,10 @@ export function createMemoryCompartments({
     if (!query || PRIVATE_RECALL_STOPWORDS.has(query)) return '';
     const terms = recallTerms(query);
     const explicit = /(?:群里|海沟|higo|群友|水群|那群人|那帮人|他们.*聊|都在聊|群.*聊|在群|群动态)/i.test(query);
-    const privExplicit = /(?:上次|之前|那次|昨晚|昨天|前天|周末|周六|周日|傍晚|日记|记得|约定|当时)/i.test(query);
+    const privExplicit = /(?:上次|之前|那次|昨晚|昨天|前天|周末|周六|周日|傍晚|日记|记得|约定|当时|几次)/i;
     const groups = Object.entries(personaCfg().memoryCompartments || {}).filter(([key, comp]) => key.startsWith('group:') && comp?.dir);
     recallIndex.retain([...groups.map(([k]) => k), key]);
+    const eventBullets = [];
     const privBullets = [];
     const privComp = MEMORY_COMPARTMENTS[key];
     if (privComp?.diaryDir) {
@@ -440,6 +480,16 @@ export function createMemoryCompartments({
         const pMatches = matchingEntities(query, pIndex.entities);
         for (const { tag, date, lines } of pIndex.sources) {
           if (tag === '常驻' || tag === '百字档案') continue;
+          if (tag === '事件簿') {
+            for (const line of lines) {
+              const sc = scoreRecall(line, terms, pMatches, privExplicit);
+              if (sc >= 4) {
+                const cleanLine = line.replace(/\s*\[标签:\s*[^\]]+\]\s*$/, '');
+                eventBullets.push({ score: sc + 1.5, text: cleanLine.slice(0, 380) });
+              }
+            }
+            continue;
+          }
           const ageDays = date == null ? Infinity : Math.max(0, (Date.now() - date) / 86_400_000);
           const recency = 1 / (1 + ageDays / 14);
           for (const line of lines) {
@@ -449,6 +499,7 @@ export function createMemoryCompartments({
             }
           }
         }
+        eventBullets.sort((a, b) => b.score - a.score);
         privBullets.sort((a, b) => b.score - a.score);
       } catch {}
     }
@@ -493,10 +544,17 @@ export function createMemoryCompartments({
     live.sort((a, b) => b.score - a.score || b.time - a.time);
     const top = (hits, n = 5) => [...new Set(hits.map((hit) => hit.text))].slice(0, n);
     let out = '';
-    const topPriv = top(privBullets, 4);
+    const topEvents = top(eventBullets, 3);
+    if (topEvents.length) {
+      const ebHint = privComp?.eventBookPath ? privComp.eventBookPath.replace(/\\/g, "/") : "memory/owner/event_book.md";
+      out += `\n【Creator 详细事件簿按需巡回（event_book.md 命中条目，如需翻查全部历史记录可 view_file 读取 "${ebHint}"）】\n`
+        + topEvents.map((line) => '- ' + line).join('\n')
+        + '\n';
+    }
+    const topPriv = top(privBullets, 3);
     if (topPriv.length) {
-      const diaryPathHint = privComp?.diaryDir ? privComp.diaryDir.replace(/\\/g, '/') : 'memory/creator_private/diary';
-      out += `\n【私聊历史日记按需巡回（如需完整翻看整篇日记细节，可先 view_file 读取 "${diaryPathHint}/<日期>.md"）】\n`
+      const dpHint = privComp?.diaryDir ? privComp.diaryDir.replace(/\\/g, "/") : "memory/owner/diary";
+      out += `\n【私聊历史日记按需巡回（如需完整翻看整篇日记细节，可先 view_file 读取 "${dpHint}/<日期>.md"）】\n`
         + topPriv.map((line) => '- ' + line).join('\n')
         + '\n';
     }

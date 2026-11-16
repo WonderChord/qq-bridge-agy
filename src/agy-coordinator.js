@@ -171,7 +171,7 @@ export class AgyApiClient {
     return { result: { ok: true, value: {} } };
   }
 
-  _pruneStaleTurns(maxAgeMs = 75000) {
+  _pruneStaleTurns(maxAgeMs = 180000) {
     const now = Date.now();
     const expiredSids = new Map();
     for (const [t, info] of this._activeTurns.entries()) {
@@ -273,6 +273,7 @@ export class AgyApiClient {
     if (!active || active.sessionId !== sessionId || active.workerId !== workerId) return 'stale';
     if (active.claimed) return 'duplicate';
     active.claimed = true;
+    active.startedAt = Date.now();
     return 'claimed';
   }
 

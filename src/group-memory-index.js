@@ -41,6 +41,45 @@ function watchDirectories(targets, invalidate) {
   }
 }
 
+function parseEventBookBlocks(raw) {
+  const blocks = [];
+  let currentHeader = '';
+  let currentTags = '';
+  let currentDetail = '';
+  const flush = () => {
+    if (!currentHeader) return;
+    const text = `${currentHeader}${currentDetail ? ' —— ' + currentDetail : ''}${currentTags ? ' [标签: ' + currentTags + ']' : ''}`;
+    blocks.push(text);
+    currentHeader = '';
+    currentTags = '';
+    currentDetail = '';
+  };
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const mBulletEvt = line.match(/^[-*]\s*\*\*(\[EVT-[^*]+)\*\*(.*)$/);
+    if (line.startsWith('### ')) {
+      flush();
+      currentHeader = line.replace(/^###\s+/, '').trim();
+    } else if (mBulletEvt) {
+      flush();
+      currentHeader = mBulletEvt[1].trim();
+      const tail = (mBulletEvt[2] || '').trim();
+      if (tail) currentTags = tail;
+    } else if (currentHeader) {
+      const mTag = line.match(/^[-*]\s*\*\*(?:检索标签|关键词)\*\*[：:]\s*(.+)$/);
+      const mDet = line.match(/^[-*]\s*\*\*(?:事件与细节|始末)\*\*[：:]\s*(.+)$/);
+      if (mTag) currentTags = mTag[1].trim();
+      else if (mDet) currentDetail = mDet[1].trim();
+      else if (!line.startsWith('#') && !line.startsWith('>')) {
+        currentDetail += (currentDetail ? ' ' : '') + line.replace(/^[-*]\s+/, '');
+      }
+    }
+  }
+  flush();
+  return blocks;
+}
+
 function parseFile(file, previous, isProfile) {
   try {
     const stat = fs.statSync(file, { throwIfNoEntry: false });
@@ -50,8 +89,11 @@ function parseFile(file, previous, isProfile) {
     // 人物条目可以出现在标题或正文里，先提取整个文件，再参与所有行的评分。
     const entities = isProfile ? [...raw.matchAll(/`([^`\r\n]{2,40})`|\*\*([^*\r\n]{2,40})\*\*/g)]
       .map((m) => (m[1] || m[2]).trim().toLowerCase()) : [];
-    const lines = raw.split(/\r?\n/).map((line) => line.trim())
-      .filter((line) => line && !/^[#>]/.test(line)).map((line) => line.replace(/^[-*]\s+/, ''));
+    const isEventBook = path.basename(file).toLowerCase() === 'event_book.md';
+    const lines = isEventBook
+      ? parseEventBookBlocks(raw)
+      : raw.split(/\r?\n/).map((line) => line.trim())
+          .filter((line) => line && !/^[#>]/.test(line)).map((line) => line.replace(/^[-*]\s+/, ''));
     return { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, entities, lines };
   } catch { return null; }
 }
@@ -74,9 +116,10 @@ export function createGroupMemoryIndex() {
     entry.dirty = false;
     const summaryDir = path.dirname(summaryPath);
     const peopleFile = path.join(summaryDir, 'people.md');
+    const eventBookFile = path.join(summaryDir, 'event_book.md');
     const peopleDir = path.join(summaryDir, 'people');
     const md = (name) => name.endsWith('.md');
-    const targets = [[summaryPath, false], [peopleFile, false], [peopleDir, true], [diaryDir, true]].flatMap(([file, isDir]) => {
+    const targets = [[summaryPath, false], [peopleFile, false], [eventBookFile, false], [peopleDir, true], [diaryDir, true]].flatMap(([file, isDir]) => {
       const name = path.basename(file);
       const parent = [path.dirname(file), (changed) => changed === name];
       return isDir ? [parent, [file, md]] : [parent];
@@ -98,15 +141,16 @@ export function createGroupMemoryIndex() {
     }
     add(summaryPath, '常驻', true);
     add(peopleFile, '百字档案', true);
+    add(eventBookFile, '事件簿', true);
     for (const name of markdownFiles(peopleDir)) add(path.join(peopleDir, name), '人物/' + name.slice(0, -3), true);
     const diary = markdownFiles(diaryDir).filter((name) => !/raw|chatlog/i.test(name));
-    // 日期日记按文件名选最新六份。兼容旧版非日期日记，空位按 mtime 补齐。
-    const daily = diary.filter((name) => dailyFile.test(name)).reverse().slice(0, 6);
-    if (daily.length < 6) {
+    // 日期日记按文件名选最新 30 份。兼容旧版非日期日记，空位按 mtime 补齐。
+    const daily = diary.filter((name) => dailyFile.test(name)).reverse().slice(0, 30);
+    if (daily.length < 30) {
       const other = diary.filter((name) => !dailyFile.test(name)).map((name) => ({
         name, mtime: fs.statSync(path.join(diaryDir, name), { throwIfNoEntry: false })?.mtimeMs || 0,
       })).sort((a, b) => b.mtime - a.mtime || b.name.localeCompare(a.name));
-      daily.push(...other.slice(0, 6 - daily.length).map((item) => item.name));
+      daily.push(...other.slice(0, 30 - daily.length).map((item) => item.name));
     }
     for (const name of daily) {
       const tag = name.slice(0, -3);

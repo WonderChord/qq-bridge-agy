@@ -6,8 +6,10 @@
 //   2) 一轮同时回复多个群友（--batch JSON 数组，按顺序高速连发不同引用/点名）：
 //      node scripts/agy-reply-and-wait.mjs --worker-id w2 --finish-turn "agy-turn-12" --key "group:123456789" --token "<token>" --seq 245 --batch "[{\"reply\":\"101\",\"messages\":[\"第一人回复\"]},{\"reply\":\"102\",\"messages\":[\"第二人回复\"]}]"
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, loadConfig, readConsoleToken, sessionToken } from './bridge-local.mjs';
+import { splitDrama3TextForTts, ensureJapaneseTtsText } from '../src/tts.js';
 
 
 function parseArgs(argv) {
@@ -34,6 +36,7 @@ function parseArgs(argv) {
     sleepMs: null,
     noWait: false,
     noReply: false,
+    memo: null,
     messages: [],
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -58,9 +61,27 @@ function parseArgs(argv) {
     }
     else if (a === '--tts-provider' && i + 1 < argv.length) opts.ttsProvider = String(argv[++i]).trim();
     else if (a === '--tts-ref' && i + 1 < argv.length) opts.ttsRef = String(argv[++i]).trim();
-    else if (a === '--codex-draw' && i + 1 < argv.length) opts.codexDraws.push(String(argv[++i]));
+    else if ((a === '--memo' || a === '--state' || a === '--sitrep') && i + 1 < argv.length) {
+      let memoArg = String(argv[++i]).trim();
+      while (i + 1 < argv.length && !/^--[a-z]/i.test(argv[i + 1]) && opts.messages.length > 0) {
+        memoArg += ' ' + String(argv[++i]).trim();
+      }
+      opts.memo = memoArg;
+    }
+    else if (a === '--codex-draw' && i + 1 < argv.length) {
+      let drawArg = String(argv[++i]);
+      if (drawArg.trim().startsWith('{') && !drawArg.trim().endsWith('}')) {
+        while (i + 1 < argv.length && !/^--[a-z]/i.test(argv[i + 1])) {
+          const piece = String(argv[++i]);
+          drawArg += ' ' + piece;
+          if (piece.trim().endsWith('}')) break;
+        }
+      }
+      opts.codexDraws.push(drawArg);
+    }
     else if (a === '--collect-sticker' && i + 1 < argv.length) opts.collectStickers.push(String(argv[++i]));
     else if (a === '--batch' && i + 1 < argv.length) opts.batch = argv[++i];
+    else if (a === '--batch-stdin') opts.batchStdin = true;
     else if (a === '--mode' && i + 1 < argv.length) opts.mode = argv[++i];
     else if (a === '--sleep-ms' && i + 1 < argv.length) opts.sleepMs = Number(argv[++i]);
     else if (a === '--no-wait') opts.noWait = true;
@@ -71,9 +92,12 @@ function parseArgs(argv) {
     }
     else opts.messages.push(a);
   }
+  // 外部后台驱动器托管时由驱动器负责监听，回信后立即返回。
+  if (process.env.QQ_BRIDGE_FORCE_NO_WAIT === '1') opts.noWait = true;
   if (opts.noReply) {
     opts.messages = [];
     opts.batch = null;
+    opts.batchStdin = false;
     opts.sticker = null;
     opts.image = null;
     opts.tts = null;
@@ -114,130 +138,410 @@ async function sendWorkerText(port, consoleToken, token, payload) {
   }
 }
 
-const POINT_TAGS_RE = /^\[(?:laughs|laughing|small laugh|chuckling|giggles|sighs|sighing|shaky breath|breath|gasps|gasping|panting|yawning|groaning|clears throat|clear throat|sobbing|short pause|long pause|break|long-break)\]$/i;
+const POINT_TAGS_RE = /^\[(?:laughs|laughing|small laugh|chuckling|giggle|giggles|sigh|sighs|sighing|shaky breath|breath|gasp|gasps|gasping|panting|yawn|yawning|groan|groaning|clears throat|clear throat|sob|sobbing|short pause|long pause|pause|break|long-break)\]$/i;
 
 function countSpokenChars(text) {
   return String(text || '')
     .replace(/\[[^\]]*\]/g, '')
     .replace(/<[^>]*>/g, '')
-    .replace(/\s+/g, '')
+    .replace(/[\s。、，,；;：:！？!?….\-—～~♪♥♡☆「」『』（）()【】]+/g, '')
     .length;
 }
 
-// 自动将过长的单条 Drama 3 台词按气口/句号切分为多条精悍短句（每段约 18~42 个实际发音字符），
-// 既消除长句末端的声学飘逸，又显著提升首条语音到达的实时性，同时保持 <whisper>/<soft> 等尖括号闭合完整。
-export function splitLongDrama3Text(rawText, maxSpokenChars = 42) {
-  const s = String(rawText || '').trim();
-  if (!s) return [];
-  if (countSpokenChars(s) <= maxSpokenChars) return [s];
+function endsWithComma(text) {
+  const s = String(text || '')
+    .replace(/<\/?[a-zA-Z]+>/g, '')
+    .replace(/\[[^\]]*\]/g, '')
+    .trim();
+  return /[、，,；;：:]$/.test(s);
+}
 
-  let leadingDir = '';
-  let body = s;
-  const leadMatch = /^(\[[^\]]+\])\s*([\s\S]*)$/.exec(s);
-  if (leadMatch && !POINT_TAGS_RE.test(leadMatch[1].trim())) {
-    leadingDir = leadMatch[1].trim();
-    body = leadMatch[2].trim();
+function extractLeadingActingDir(text) {
+  const m = /^\s*(\[[^\]]+\])\s*([\s\S]*)$/.exec(String(text || '').trim());
+  if (m && !POINT_TAGS_RE.test(m[1].trim())) {
+    return { dir: m[1].trim(), rest: m[2].trim() };
   }
+  return { dir: '', rest: String(text || '').trim() };
+}
 
-  const atoms = [];
-  let cur = '';
-  let bracketDepth = 0;
-  let spanDepth = 0;
-  for (let i = 0; i < body.length; i += 1) {
-    const rest = body.slice(i);
-    if (bracketDepth === 0 && spanDepth === 0) {
-      const pauseMatch = /^\[(?:short pause|long pause|break|long-break)\]\s*/i.exec(rest);
-      if (pauseMatch) {
-        if (cur.trim()) atoms.push(cur.trim());
-        cur = '';
-        i += pauseMatch[0].length - 1;
-        continue;
-      }
-    }
-    if (bracketDepth === 0 && rest[0] === '<') {
-      const closeMatch = /^<\/[a-z_]+>/i.exec(rest);
-      if (closeMatch) {
-        cur += closeMatch[0];
-        spanDepth = Math.max(0, spanDepth - 1);
-        i += closeMatch[0].length - 1;
-        if (spanDepth === 0 && /[。！？!?♪♥]\s*<\/[a-z_]+>$/i.test(cur)) {
-          if (cur.trim()) atoms.push(cur.trim());
-          cur = '';
-        }
-        continue;
-      }
-      const openMatch = /^<[a-z_]+>/i.exec(rest);
-      if (openMatch) {
-        cur += openMatch[0];
-        spanDepth += 1;
-        i += openMatch[0].length - 1;
-        continue;
-      }
-    }
-    const ch = body[i];
-    if (ch === '[') bracketDepth += 1;
-    else if (ch === ']' && bracketDepth > 0) bracketDepth -= 1;
-    cur += ch;
-    if (bracketDepth === 0 && spanDepth === 0 && /[。！？!?♪♥]/.test(ch)) {
-      const nextCh = body[i + 1] || '';
-      if (!/[。！？!?♪♥”’」』）\)]/.test(nextCh)) {
-        if (cur.trim()) atoms.push(cur.trim());
-        cur = '';
-      }
-    }
-  }
-  if (cur.trim()) atoms.push(cur.trim());
-
-  if (atoms.length <= 1) return [s];
-
-  const merged = [];
-  let acc = '';
-  for (const atom of atoms) {
-    if (!acc) {
-      acc = atom;
-      continue;
-    }
-    const accLen = countSpokenChars(acc);
-    const atomLen = countSpokenChars(atom);
-    if (accLen < 15 || (accLen + atomLen <= maxSpokenChars)) {
-      acc = `${acc} ${atom}`;
-    } else {
-      merged.push(acc);
-      acc = atom;
-    }
-  }
-  if (acc) {
-    if (merged.length > 0 && countSpokenChars(acc) < 12) {
-      merged[merged.length - 1] = `${merged[merged.length - 1]} ${acc}`;
-    } else {
-      merged.push(acc);
-    }
-  }
-
-  return merged.map((seg) => {
-    const trimmed = seg.trim();
-    if (!leadingDir) return trimmed;
-    const firstTag = /^(\[[^\]]+\])/.exec(trimmed);
-    if (firstTag && !POINT_TAGS_RE.test(firstTag[1])) return trimmed;
-    return `${leadingDir} ${trimmed}`;
-  });
+export function splitLongDrama3Text(rawText, maxSpokenChars = 150) {
+  return splitDrama3TextForTts(rawText, maxSpokenChars);
 }
 
 function expandTtsSegments(rawInput) {
-  const list = Array.isArray(rawInput) ? rawInput : (rawInput ? [rawInput] : []);
+  const rawList = (Array.isArray(rawInput) ? rawInput : (rawInput ? [rawInput] : []))
+    .map((x) => String(x || '').trim())
+    .filter(Boolean);
+  if (rawList.length === 0) return [];
+
+  // 默认把同一轮的多句情话无缝合成单条连贯语音（总发音字数 <= 140 时自动合并，省去重复演技前缀字节并保持情绪不断气）
+  const coalesced = [];
+  for (const item of rawList) {
+    const jpCheck = ensureJapaneseTtsText(item);
+    if (!jpCheck.ok) {
+      console.error(`[agy-reply-and-wait] 已拦截非日语 --tts 段 (${jpCheck.reason}): ${String(item).slice(0, 60)}`);
+      continue;
+    }
+    const { dir, rest } = extractLeadingActingDir(jpCheck.text);
+    if (coalesced.length === 0) {
+      coalesced.push(dir ? `${dir} ${rest}` : rest);
+      continue;
+    }
+    const prev = coalesced[coalesced.length - 1];
+    const prevLen = countSpokenChars(prev);
+    const curLen = countSpokenChars(rest);
+    if (endsWithComma(prev) || prevLen + curLen <= 140 || prevLen < 20 || curLen < 20) {
+      coalesced[coalesced.length - 1] = `${prev} ${rest}`.replace(/\s+/g, ' ').trim();
+    } else {
+      coalesced.push(dir ? `${dir} ${rest}` : rest);
+    }
+  }
+
+  // 单条长情话保持整条不断开（仅超过 150 发音字的超长独白才按完整句末自然切分）
   const out = [];
-  for (const item of list) {
-    for (const seg of splitLongDrama3Text(item, 42)) {
-      if (seg) out.push(seg);
+  for (const item of coalesced) {
+    for (const seg of splitLongDrama3Text(item, 150)) {
+      if (!seg) continue;
+      out.push(seg.trim());
     }
   }
   return out;
 }
 
-async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTurn, maxTurns, finishFirst = true) {
-  const effectiveMaxTurns = Number.isFinite(maxTurns)
+function inferUnifiedTtsRef(segments, explicitRef, key) {
+  if (explicitRef) return String(explicitRef).trim();
+  const joined = (Array.isArray(segments) ? segments : []).join(' ');
+  if (/<stress>|<forceful>|\[(?:indignant|disdainful|angry|annoyed|frustrated|sarcastic)\]|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|いじわる|怒|からかって/i.test(joined)) {
+    return '02_tsukkomi';
+  }
+  if (/ひゃあっ|きゃあっ|あぁっ|イく|イっちゃ|気持ちよすぎ|壊れちゃ|もうダメ|限界/i.test(joined)) {
+    return '04_shy_flustered';
+  }
+  if (/<fast>|\[(?:smug|guilty|panicked|nervous)\]|くふふ|ふふっ|えへへ|ヤッホー|おはよ|お疲れ|クール|低い声/i.test(joined)) {
+    return '05_happy_clingy';
+  }
+  if (/<whisper>|おやすみ|眠|二度寝|とろけ|んちゅ|ちゅっ|にゃあ/i.test(joined)) {
+    return '03_nadenade';
+  }
+  return '01_default';
+}
+
+const ERPLAY_RE = /『[^』]+』|（[^）]{8,}）/;
+const ERPLAY_STATE_FILE = path.join(ROOT, 'state', 'agy-worker-erplay.json');
+const ERPLAY_TTL_MS = 45 * 60 * 1000;
+const SITUATION_MEMO_FILE = path.join(ROOT, 'state', 'agy-situation-memo.json');
+const SITUATION_MEMO_TTL_MS = 6 * 3600 * 1000; // 6小时内有效，跨换新线程无缝交接当前状况
+const WORKER_CURSOR_FILE = path.join(ROOT, 'state', 'agy-worker-cursor.json');
+
+function readWorkerCursor(workerId, reset = false) {
+  const wid = String(workerId || 'w1');
+  if (reset) return { wid, all: {}, cur: { lastKey: '', seenSeq: {} } };
+  try {
+    if (fs.existsSync(WORKER_CURSOR_FILE)) {
+      const all = JSON.parse(fs.readFileSync(WORKER_CURSOR_FILE, 'utf8')) || {};
+      const cur = all[wid] || { lastKey: '', seenSeq: {} };
+      return { wid, all, cur: { lastKey: cur.lastKey || '', seenSeq: { ...(cur.seenSeq || {}) } } };
+    }
+  } catch {}
+  return { wid, all: {}, cur: { lastKey: '', seenSeq: {} } };
+}
+
+function saveWorkerCursor(wid, all, cur) {
+  try {
+    all[wid] = { ...cur, updatedAt: Date.now() };
+    fs.mkdirSync(path.dirname(WORKER_CURSOR_FILE), { recursive: true });
+    fs.writeFileSync(WORKER_CURSOR_FILE, JSON.stringify(all, null, 2), 'utf8');
+  } catch {}
+}
+
+function sliceRecentKeepingTextAnchors(items, minTextAnchors, maxTotal) {
+  if (items.length <= minTextAnchors) return items;
+  let textCount = 0;
+  let startIdx = items.length;
+  for (let i = items.length - 1; i >= 0; i -= 1) {
+    startIdx = i;
+    const txt = String(items[i]?.text || items[i]?.plain || '').trim();
+    if (!/^\[(?:语音|图片|动画表情)/.test(txt)) textCount += 1;
+    if (textCount >= minTextAnchors || (items.length - startIdx) >= maxTotal) break;
+  }
+  return items.slice(startIdx);
+}
+
+function normalizeMemoKey(key) {
+  const k = String(key || '').trim();
+  if (!k.startsWith('private:')) return k;
+  try {
+    const cfg = loadConfig();
+    const uids = new Set([
+      ...(Array.isArray(cfg.persona?.creatorUids) ? cfg.persona.creatorUids.map(String) : []),
+      ...(cfg.ownerQQ ? [String(cfg.ownerQQ)] : []),
+    ]);
+    if (uids.has(k.slice(8))) return 'private:creator';
+  } catch {}
+  return k;
+}
+
+function readSituationMemoMap() {
+  try {
+    if (fs.existsSync(SITUATION_MEMO_FILE)) {
+      return JSON.parse(fs.readFileSync(SITUATION_MEMO_FILE, 'utf8')) || {};
+    }
+  } catch {}
+  return {};
+}
+
+function writeSituationMemoMap(map) {
+  try {
+    fs.mkdirSync(path.dirname(SITUATION_MEMO_FILE), { recursive: true });
+    fs.writeFileSync(SITUATION_MEMO_FILE, JSON.stringify(map, null, 2), 'utf8');
+  } catch {}
+}
+
+function deriveAutoSituationFromText(text) {
+  const s = softenWakeText(String(text || '').trim());
+  if (!s) return null;
+  let posture = '';
+  let mood = '';
+  if (/被窝|回床|床上|躺/.test(s)) posture = '休息/卧谈中';
+  else if (/电脑桌|电脑椅|陪工/.test(s)) posture = '书桌前陪伴中';
+  if (/晚安|入睡|睡觉/.test(s)) mood = '准备休息';
+  else if (ERPLAY_RE.test(s)) mood = '沉浸角色扮演互动中';
+  const actionMatch = /（([^）]{4,48})）/.exec(s);
+  const briefAction = actionMatch ? actionMatch[1].replace(/\s+/g, ' ').trim() : '';
+  return { posture, clothing: '', mood, briefAction };
+}
+
+function updateSituationMemo(opts) {
+  const mKey = normalizeMemoKey(opts.key);
+  if (!mKey) return;
+  const map = readSituationMemoMap();
+  const prev = map[mKey] || {};
+  const now = Date.now();
+  const isFresh = prev.updatedAtMs && (now - prev.updatedAtMs) < SITUATION_MEMO_TTL_MS;
+  const base = isFresh ? { ...prev } : { key: mKey };
+
+  const rawReply = [
+    ...(opts.messages || []),
+    ...(opts.batch ? [String(opts.batch)] : []),
+  ].join(' ').trim();
+
+  if (opts.memo) {
+    base.manualMemo = softenWakeText(String(opts.memo).trim()).slice(0, 220);
+  }
+  if (rawReply) {
+    const auto = deriveAutoSituationFromText(rawReply);
+    if (auto) {
+      if (auto.posture) base.posture = auto.posture;
+      if (auto.clothing) base.clothing = auto.clothing;
+      if (auto.mood) base.mood = auto.mood;
+      if (auto.briefAction) base.lastAction = auto.briefAction;
+    }
+    const cleanReply = softenWakeText(rawReply)
+      .replace(/（[^）]{25,}）/g, (m) => `${m.slice(0, 24)}…）`)
+      .slice(0, 110);
+    const recentTurns = Array.isArray(base.recentTurns) ? base.recentTurns.slice(-2) : [];
+    recentTurns.push({
+      at: new Date(now).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }),
+      reply: cleanReply,
+      hasTts: Boolean(opts.tts || (opts.ttsList && opts.ttsList.length > 0)),
+    });
+    base.recentTurns = recentTurns;
+  }
+  base.updatedAtMs = now;
+  base.updatedAt = new Date(now).toLocaleString('zh-CN', { hour12: false });
+  base.workerId = opts.workerId || 'w1';
+  map[mKey] = base;
+  writeSituationMemoMap(map);
+}
+
+function formatSituationMemoBanner(key, allRecent = []) {
+  const mKey = normalizeMemoKey(key);
+  if (!mKey) return '';
+  const map = readSituationMemoMap();
+  const entry = map[mKey];
+  const now = Date.now();
+  const hasSaved = entry && entry.updatedAtMs && (now - entry.updatedAtMs) < SITUATION_MEMO_TTL_MS;
+
+  // 若还没有存盘摘要或刚重启，自动从最近 6 条消息实时提炼一份当前状况！
+  let posture = hasSaved ? (entry.posture || '') : '';
+  let clothing = hasSaved ? (entry.clothing || '') : '';
+  let mood = hasSaved ? (entry.mood || '') : '';
+  let lastAction = hasSaved ? (entry.lastAction || '') : '';
+  const manualMemo = hasSaved ? (entry.manualMemo || '') : '';
+
+  if ((!posture || !mood) && Array.isArray(allRecent) && allRecent.length > 0) {
+    for (const m of allRecent.slice(-6)) {
+      const auto = deriveAutoSituationFromText(m?.text || m?.plain || '');
+      if (!auto) continue;
+      if (auto.posture) posture = auto.posture;
+      if (auto.clothing) clothing = auto.clothing;
+      if (auto.mood) mood = auto.mood;
+      if (auto.briefAction && m?.isSelf) lastAction = auto.briefAction;
+    }
+  }
+
+  const lines = [];
+  if (manualMemo) lines.push(`- 交接备忘：${manualMemo}`);
+  const stateParts = [
+    posture ? `场景/体位：${posture}` : '',
+    clothing ? `穿搭：${clothing}` : '',
+    mood ? `当前状态与节奏：${mood}` : '',
+    lastAction ? `上一拍动作：${lastAction}` : '',
+  ].filter(Boolean);
+  if (stateParts.length > 0) {
+    lines.push(`- 现场态势：${stateParts.join(' ｜ ')}`);
+  }
+  if (hasSaved && Array.isArray(entry.recentTurns) && entry.recentTurns.length > 0) {
+    const trail = entry.recentTurns
+      .map((t) => `[${t.at}${t.hasTts ? '+语音' : ''}] ${t.reply}`)
+      .join(' → ');
+    lines.push(`- 刚刚连贯轨迹：${trail}`);
+  }
+  if (lines.length === 0) return '';
+  return `【短期情境交接卡（跨线程换新无缝衔接当前状况，请顺着此现场态势自然接话，可用 --memo "一句话新状况" 更新）】\n${lines.join('\n')}\n`;
+}
+
+// 兼容清理：剥离旧记忆或历史习惯残留的 #...# 标签外壳，不再将标签强制替换为固定死板的套话词组。
+const LEGACY_TEXT_TAG_CLEANUP = [
+  [/#s_[a-z_]+#/gi, ''],
+  [/#([a-zA-Z0-9_\u4e00-\u9fa5]{1,12})#/g, '$1'],
+];
+
+const LEGACY_TTS_TAG_CLEANUP = [
+  [/#s_[a-z_]+#/gi, ''],
+  [/#[a-zA-Z0-9_\u4e00-\u9fa5]{1,16}#/g, ''],
+];
+
+function decodeOutboundText(raw) {
+  let out = String(raw || '');
+  for (const [re, rep] of LEGACY_TEXT_TAG_CLEANUP) out = out.replace(re, rep);
+  return out;
+}
+
+function decodeOutboundTts(raw) {
+  let out = String(raw || '');
+  for (const [re, rep] of LEGACY_TTS_TAG_CLEANUP) out = out.replace(re, rep);
+  return out;
+}
+
+// 默认原样透传消息文本（仅清理残留的 #s_...# 音效占位标签）。
+function softenWakeText(raw) {
+  return String(raw || '').replace(/#s_[a-z_]+#/gi, '');
+}
+
+function compactRecentMessageText(raw, isSelf, isIntimateMode) {
+  const s = softenWakeText(String(raw || '').trim());
+  if (!isIntimateMode) return s.slice(0, 260);
+  // 完整保留近期回合的（）双向动作细节与『』直白/纯爱台词，不断档不阉割语感
+  return s.slice(0, isSelf ? 380 : 300);
+}
+
+async function enrichWakeTextWithHistory(port, consoleToken, w, isFirstTurnDefault = false, isErplay = false) {
+  const rawText = String(w?.text || '');
+  const key = String(w?.key || '');
+  if (!key || !rawText.includes('【本次消息快照】')) return rawText;
+  const wid = String(w?.workerId || 'w1');
+  const isFirstTurn = isFirstTurnDefault || Number(w?.workerTurnIndex) <= 1;
+  const { all: cursorAll, cur: cursor } = readWorkerCursor(wid, isFirstTurn);
+  const prevSeenSeq = Number(cursor.seenSeq?.[key]) || 0;
+  const switchedKey = Boolean(cursor.lastKey && cursor.lastKey !== key);
+  const isSessionFirstLoad = isFirstTurn || !prevSeenSeq || /【角色卡已热更新|【本群日常常驻记忆|【本会话分舱长期记忆/.test(rawText);
+  const isPrivate = key.startsWith('private:');
+  const isIntimate = isPrivate && (isErplay || ERPLAY_RE.test(rawText));
+  try {
+    const res = await fetch(
+      `http://127.0.0.1:${port}/api/socialV2/recent?key=${encodeURIComponent(key)}&limit=70`,
+      {
+        headers: consoleToken ? { 'x-console-token': consoleToken } : {},
+        signal: AbortSignal.timeout(4000),
+      }
+    );
+    if (!res.ok) return rawText;
+    const data = await res.json();
+    const allRecent = Array.isArray(data?.messages) ? data.messages : [];
+    const marker = '【本次消息快照】\n';
+    const snapIdx = rawText.indexOf(marker);
+    if (snapIdx < 0) return rawText;
+    const jsonStart = snapIdx + marker.length;
+    const jsonEnd = rawText.indexOf('\n', jsonStart);
+    const jsonLine = jsonEnd >= 0 ? rawText.slice(jsonStart, jsonEnd) : rawText.slice(jsonStart);
+    const packet = JSON.parse(jsonLine);
+    const recentHasErplay = isIntimate || allRecent.slice(-8).some((m) => ERPLAY_RE.test(String(m?.text || m?.plain || '')));
+    if (Array.isArray(packet.messages)) {
+      packet.messages = packet.messages.map((m) => ({
+        ...m,
+        ...(m?.text ? { text: softenWakeText(m.text) } : {}),
+      }));
+    }
+    const unreadSeqs = new Set((packet.messages || []).map((m) => m?.seq).filter(Number.isSafeInteger));
+    const filteredRecent = allRecent.filter(
+      (m) => m && (!Number.isSafeInteger(m.seq) || !unreadSeqs.has(m.seq)) && !(m.isSelf && /^\[语音/.test(String(m.text || m.plain || '')))
+    );
+    let selectedRecent;
+    if (isSessionFirstLoad) {
+      selectedRecent = filteredRecent.slice(-(isIntimate ? 10 : (isPrivate ? 14 : 12)));
+    } else if (isPrivate) {
+      // 连续私聊：排除纯[语音]/[图片]占位影响，保底留 2 条真实文字锚点（防双气泡或语音顶掉）；从群聊切回私聊时留 4 条 + 态势卡防断片
+      selectedRecent = sliceRecentKeepingTextAnchors(filteredRecent, switchedKey ? 4 : 2, switchedKey ? 6 : 4);
+    } else {
+      // 群聊潜水期间可能有未唤醒的新消息：按 prevSeenSeq 增量补齐潜水期漏看的上下文（最多 12 条），连发抢答时则只带 2~4 条，绝不丢群聊上文也不重复灌水
+      const unseenDelta = filteredRecent.filter((m) => !Number.isSafeInteger(m.seq) || m.seq > prevSeenSeq).length;
+      const groupKeep = Math.min(12, Math.max(switchedKey ? 4 : 2, unseenDelta));
+      selectedRecent = sliceRecentKeepingTextAnchors(filteredRecent, groupKeep, 12);
+    }
+    packet.recent = selectedRecent.map((m) => ({
+      ...(m.seq != null ? { seq: m.seq } : {}),
+      ...(m.messageId ? { messageId: String(m.messageId) } : {}),
+      sender: m.isSelf ? '我' : String(m.sender || ''),
+      ...(m.userId && !m.isSelf ? { userId: String(m.userId) } : {}),
+      text: compactRecentMessageText(m.text || m.plain || '', Boolean(m.isSelf), recentHasErplay),
+      ...(m.isSelf ? { isSelf: true } : {}),
+    }));
+    let maxSeq = Math.max(prevSeenSeq, Number(packet.readThroughSeq) || 0);
+    for (const m of allRecent) if (Number.isSafeInteger(m?.seq) && m.seq > maxSeq) maxSeq = m.seq;
+    cursor.lastKey = key;
+    cursor.seenSeq[key] = maxSeq;
+    saveWorkerCursor(wid, cursorAll, cursor);
+
+    const memoBanner = (isSessionFirstLoad || (isPrivate && switchedKey)) ? formatSituationMemoBanner(key, allRecent) : '';
+    const prefixText = rawText.slice(0, snapIdx);
+    return prefixText + memoBanner + marker + JSON.stringify(packet) + (jsonEnd >= 0 ? rawText.slice(jsonEnd) : '');
+  } catch {
+    return rawText;
+  }
+}
+
+function resolveErplayActive(workerId, opts) {
+  const chunks = [...(opts.messages || [])];
+  if (opts.batch) chunks.push(String(opts.batch));
+  if (opts.tts) chunks.push(String(opts.tts));
+  const hitNow = ERPLAY_RE.test(chunks.join('\n'));
+  const now = Date.now();
+  let state = {};
+  try {
+    if (fs.existsSync(ERPLAY_STATE_FILE)) {
+      state = JSON.parse(fs.readFileSync(ERPLAY_STATE_FILE, 'utf8')) || {};
+    }
+  } catch {}
+  if (hitNow) {
+    state[workerId] = now;
+    try {
+      fs.mkdirSync(path.dirname(ERPLAY_STATE_FILE), { recursive: true });
+      fs.writeFileSync(ERPLAY_STATE_FILE, JSON.stringify(state, null, 2));
+    } catch {}
+    return true;
+  }
+  const lastAt = Number(state[workerId]) || 0;
+  return lastAt > 0 && (now - lastAt) < ERPLAY_TTL_MS;
+}
+
+async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTurn, maxTurns, finishFirst = true, isErplay = false) {
+  let effectiveMaxTurns = Number.isFinite(maxTurns)
     ? maxTurns
-    : (workerId !== 'primary' ? 25 : 0);
+    : (workerId !== 'primary' ? 30 : 0);
+  if (isErplay && effectiveMaxTurns > 20) {
+    effectiveMaxTurns = 20;
+  }
   while (true) {
     const qs = new URLSearchParams({ timeoutMs: '55000', workerId });
     if (priority !== '') qs.set('priority', priority);
@@ -272,9 +576,10 @@ async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTu
         const extractedToken = w.agentToken || (tokMatch ? tokMatch[1] : '');
         console.log(`=== QQ 唤醒 [${workerId}${w.workerTurnIndex ? ` | ${w.workerTurnIndex}/${effectiveMaxTurns || '∞'}` : ''}] Key=${w.key ?? '-'} Turn=${w.turn} Token=${extractedToken || '-'} ===`);
         if (w.imageCount > 0) {
-          console.log(`媒体: ${w.imageCount}张（需看图时: node "${path.join(ROOT, 'scripts')}\\agy-get-image.mjs" --key "${w.key}" --token "${extractedToken || '<Token>'}" --msg "<msgId>"）`);
+          console.log(`媒体: ${w.imageCount}张（需看图时: node "${path.join(ROOT, 'scripts', 'agy-get-image.mjs').replace(/\\/g, '/')}" --key "${w.key}" --token "${extractedToken || '<Token>'}" --msg "<msgId>"）`);
         }
-        console.log(w.text);
+        const enrichedText = await enrichWakeTextWithHistory(port, consoleToken, w, false, isErplay);
+        console.log(softenWakeText(enrichedText));
         process.exit(0);
       }
     } catch {
@@ -285,6 +590,16 @@ async function waitNextWakeLoop(port, consoleToken, workerId, priority, finishTu
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  let batchFromStdin = null;
+  if (opts.batchStdin) {
+    if (opts.batch !== null || opts.messages.length) throw new Error('--batch-stdin 需单独提供批量消息');
+    batchFromStdin = JSON.parse(fs.readFileSync(0, 'utf8').replace(/^\uFEFF/, ''));
+    if (!Array.isArray(batchFromStdin) || !batchFromStdin.length || batchFromStdin.some(item => !item || typeof item !== 'object' || Array.isArray(item))) {
+      throw new Error('--batch-stdin 需要非空的 JSON 对象数组');
+    }
+    opts.batch = JSON.stringify(batchFromStdin);
+  }
+  const isErplay = resolveErplayActive(opts.workerId, opts);
   if (opts.key) opts.token = sessionToken(opts.key, opts.token);
   const cfg = loadConfig();
   const port = Number(cfg.consolePort) || 3100;
@@ -298,14 +613,14 @@ async function main() {
       if (claim.duplicate) {
         console.log('[agy-reply-and-wait] 此回合已有回复任务，重复调用已忽略。');
         if (!opts.noWait) {
-          await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false);
+          await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false, isErplay);
         }
         return;
       }
     } catch (err) {
       // 旧 turn 或未确认的 claim 绝不能降级为不带 turn 的 QQ 发送。
       console.error('[agy-reply-and-wait] 未取得回合，跳过发送：' + err.message);
-      if (!opts.noWait) await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false);
+      if (!opts.noWait) await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, '', opts.maxTurns, false, isErplay);
       else if (err.status !== 404 && err.status !== 409) process.exitCode = 1;
       return;
     }
@@ -345,8 +660,9 @@ async function main() {
         const joined = [opts.batch, ...opts.messages].join(' ');
         candidates.push(joined, joined.replace(/\\+"/g, '"'));
       }
-      let parsedOk = false;
-      for (const c of candidates) {
+      let parsedOk = batchFromStdin !== null;
+      if (parsedOk) items = batchFromStdin;
+      else for (const c of candidates) {
         try { items = JSON.parse(c); parsedOk = true; break; } catch {}
       }
       if (parsedOk && opts.messages.length > 0) opts.messages = [];
@@ -366,13 +682,14 @@ async function main() {
         }
         console.error(`[agy-reply-and-wait] --batch JSON 解析失败，已正则抢救 ${items.length} 组消息`);
       }
+      if (!Array.isArray(items) || !items.length) failed = true;
       if (Array.isArray(items)) {
         for (const item of items) {
           if (!item) continue;
           if (!batchReply && item.reply) batchReply = String(item.reply);
-          const msgs = Array.isArray(item.messages)
+          const msgs = (Array.isArray(item.messages)
             ? item.messages
-            : (item.text ? [String(item.text)] : []);
+            : (item.text ? [String(item.text)] : [])).map((m) => decodeOutboundText(m));
           if (msgs.length > 0) {
             const payload = {
               key: opts.key,
@@ -411,12 +728,15 @@ async function main() {
             }
           }
           if (item.tts || item.voice) {
-            const ttsSegments = expandTtsSegments(item.tts || item.voice);
-            for (const segText of ttsSegments) {
-              const tp = { key: opts.key, text: String(segText) };
-              if (opts.finishTurn) tp.turn = opts.finishTurn;
+            const rawTtsVal = item.tts || item.voice;
+            const decodedTtsVal = Array.isArray(rawTtsVal) ? rawTtsVal.map((x) => decodeOutboundTts(x)) : decodeOutboundTts(rawTtsVal);
+            const ttsSegments = expandTtsSegments(decodedTtsVal);
+            const lockedRef = inferUnifiedTtsRef(ttsSegments, item.ttsRef || opts.ttsRef, opts.key);
+            for (let segIdx = 0; segIdx < ttsSegments.length; segIdx += 1) {
+              const segText = ttsSegments[segIdx];
+              const tp = { key: opts.key, text: String(segText), split: false, ttsRef: lockedRef };
+              if (opts.finishTurn && segIdx === 0) tp.turn = opts.finishTurn;
               if (item.ttsProvider || opts.ttsProvider) tp.provider = String(item.ttsProvider || opts.ttsProvider);
-              if (item.ttsRef || opts.ttsRef) tp.ttsRef = String(item.ttsRef || opts.ttsRef);
               try {
                 await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
               } catch (err) {
@@ -430,9 +750,10 @@ async function main() {
     }
 
     if (opts.messages.length > 0) {
+      const decodedMsgs = opts.messages.map((m) => decodeOutboundText(m));
       const payload = {
         key: opts.key,
-        messages: opts.messages.length === 1 ? opts.messages[0] : opts.messages,
+        messages: decodedMsgs.length === 1 ? decodedMsgs[0] : decodedMsgs,
       };
       if (opts.finishTurn) payload.turn = opts.finishTurn;
       if (opts.reply) payload.replyToMessageId = opts.reply;
@@ -458,7 +779,7 @@ async function main() {
     if (opts.image) {
       const ip = { key: opts.key, imagePath: String(opts.image) };
       if (opts.finishTurn) ip.turn = opts.finishTurn;
-      if (opts.messages.length === 0 && !opts.sticker && opts.reply) ip.replyToMessageId = opts.reply;
+      if (opts.messages.length === 0 && !opts.sticker && opts.reply) ip.replyToMessageId = String(opts.reply);
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-image', ip);
       } catch (err) {
@@ -466,12 +787,14 @@ async function main() {
         console.error(`[agy-reply-and-wait] 图片发送警告: ${err?.message ?? err}`);
       }
     }
-    const allTtsSegments = expandTtsSegments(opts.ttsList.length > 0 ? opts.ttsList : opts.tts);
-    for (const segText of allTtsSegments) {
-      const tp = { key: opts.key, text: String(segText) };
+    const rawTtsList = opts.ttsList.length > 0 ? opts.ttsList.map((x) => decodeOutboundTts(x)) : (opts.tts ? decodeOutboundTts(opts.tts) : []);
+    const allTtsSegments = expandTtsSegments(rawTtsList);
+    const lockedRef = inferUnifiedTtsRef(allTtsSegments, opts.ttsRef, opts.key);
+    for (let segIdx = 0; segIdx < allTtsSegments.length; segIdx += 1) {
+      const segText = allTtsSegments[segIdx];
+      const tp = { key: opts.key, text: String(segText), split: false, ttsRef: lockedRef };
       if (opts.ttsProvider) tp.provider = String(opts.ttsProvider);
-      if (opts.ttsRef) tp.ttsRef = String(opts.ttsRef);
-      if (opts.finishTurn) tp.turn = opts.finishTurn;
+      if (opts.finishTurn && segIdx === 0) tp.turn = opts.finishTurn;
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
       } catch (err) {
@@ -484,23 +807,45 @@ async function main() {
       if (!trimmed) continue;
       let spec = null;
       if (trimmed.startsWith('{')) {
-        try { spec = JSON.parse(trimmed); } catch {}
+        for (const cand of [trimmed, trimmed.replace(/\\+"/g, '"')]) {
+          try { spec = JSON.parse(cand); break; } catch {}
+        }
+        if (!spec || typeof spec !== 'object') {
+          // PowerShell 吞掉双引号时的正则无损解包（如 {prompt:...,selfRef:true}）
+          const unescaped = trimmed.replace(/\\+"/g, '"').replace(/^\{+|\}+$/g, '').trim();
+          const selfRefMatch = /,?\s*"?selfRef"?\s*:\s*(true|false)\b/i.exec(unescaped);
+          const refMsgMatch = /,?\s*"?refMsgId"?\s*:\s*"?(\d+)"?/i.exec(unescaped);
+          const asStickerMatch = /,?\s*"?asSticker"?\s*:\s*(true|false)\b/i.exec(unescaped);
+          let cleanPrompt = unescaped
+            .replace(/^"?prompt"?\s*:\s*/i, '')
+            .replace(/,?\s*"?selfRef"?\s*:\s*(?:true|false)\b/ig, '')
+            .replace(/,?\s*"?refMsgId"?\s*:\s*"?\d+"?/ig, '')
+            .replace(/,?\s*"?asSticker"?\s*:\s*(?:true|false)\b/ig, '')
+            .replace(/^"+|"+$/g, '')
+            .trim();
+          spec = {
+            prompt: cleanPrompt,
+            selfRef: selfRefMatch ? selfRefMatch[1].toLowerCase() === 'true' : true,
+            ...(refMsgMatch ? { refMsgId: refMsgMatch[1] } : {}),
+            ...(asStickerMatch ? { asSticker: asStickerMatch[1].toLowerCase() === 'true' } : {}),
+          };
+        }
       }
       if (!spec || typeof spec !== 'object') {
-        spec = { prompt: trimmed };
+        spec = { prompt: trimmed, selfRef: true };
       }
       const drawBody = {
         key: opts.key,
         turn: opts.finishTurn || undefined,
         prompt: String(spec.prompt || '').trim(),
-        ...(typeof spec.selfRef === 'boolean' ? { selfRef: spec.selfRef } : {}),
+        selfRef: typeof spec.selfRef === 'boolean' ? spec.selfRef : true,
         ...(spec.refMsgId != null ? { refMsgId: String(spec.refMsgId) } : {}),
         ...(spec.asSticker === true ? { asSticker: true } : {}),
         ...(spec.note ? { note: String(spec.note) } : {}),
         ...(spec.tags ? { tags: spec.tags } : {}),
         ...(spec.replyToMessageId || opts.reply || batchReply ? { replyToMessageId: String(spec.replyToMessageId || opts.reply || batchReply) } : {}),
       };
-      if (!drawBody.prompt) continue;
+      if (!drawBody.prompt || drawBody.prompt === '{\\') continue;
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/codex-draw', drawBody);
       } catch (err) {
@@ -551,6 +896,12 @@ async function main() {
       failed = true;
       console.error(`[agy-reply-and-wait] mark-read 警告: ${err?.message ?? err}`);
     }
+
+    if (!opts.noReply && (opts.messages.length > 0 || opts.batch || opts.memo)) {
+      try {
+        updateSituationMemo(opts);
+      } catch {}
+    }
   }
 
   if (opts.noWait) {
@@ -562,7 +913,7 @@ async function main() {
     return;
   }
 
-  await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, finishTurnForWait, opts.maxTurns);
+  await waitNextWakeLoop(port, consoleToken, opts.workerId, opts.priority, finishTurnForWait, opts.maxTurns, true, isErplay);
 }
 
 main().catch((err) => {

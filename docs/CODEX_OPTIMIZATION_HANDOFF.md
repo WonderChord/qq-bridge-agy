@@ -2,7 +2,7 @@
 
 > **更新日期**：2026-11-04
 > **上游仓库**：`https://github.com/WonderChord/qq-bridge-agy.git`（`main` 分支）
-> **部署目录**：运行库 `E:\AI\qq-bridge` ｜ 开源发布库 `E:\AI\qq-bridge-release`
+> **部署目录**：运行目录 `<QQ_BRIDGE_DIR>` ｜ 开源发布目录 `<QQ_BRIDGE_RELEASE_DIR>`
 
 ---
 
@@ -14,7 +14,7 @@
 | 监听通道 | 脚本入口 | 服务端端点 | 职责与换新周期 |
 | :--- | :--- | :--- | :--- |
 | **主力聊天线程 (`w1`)** | `scripts/agy-wait-wake.mjs`<br>`scripts/agy-reply-and-wait.mjs` | `GET /api/agy/wait-wake`<br>`POST /api/agy/claim`<br>`POST /api/agy/finish-turn` | 处理私聊与通过预筛的群聊唤醒，单步完成回复/贴图/语音/外包生图并原地重回监听；满 25 轮无状态换新 |
-| **前置预筛门控 (`judge`)** | `scripts/agy-wait-judge.mjs` | `GET /api/agy/wait-judge`<br>`POST /api/agy/judge-result` | 对群聊名字/关键词（`Nya/Nia/基米`）及潜水 `0.12` 概率抽样拉取最近 14 条上下文秒判 `yes/no`，拦截无效唤醒；满 30 轮换新 |
+| **前置预筛门控 (`judge`)** | `scripts/agy-wait-judge.mjs` | `GET /api/agy/wait-judge`<br>`POST /api/agy/judge-result` | 对群聊名字/模糊关键词（`persona.nameKeywords` / `ambiguousKeywords`）及潜水 `0.12` 概率抽样拉取最近 14 条上下文秒判 `yes/no`，拦截无效唤醒；满 60 轮换新 |
 | **分舱记忆归纳 (`archivist`)** | `scripts/agy-wait-archive.mjs` | `GET /api/agy/wait-archive`<br>`POST /api/agy/archive-done` | 当群聊满 150 条或私聊满 40 条新消息时异步提炼 `summary.md` 与 `diary/YYYY-MM-DD.md`，零聊天阻塞；满 10 轮换新 |
 
 ### 2. 已实装且不可回退的 6 项核心特性
@@ -52,11 +52,11 @@
 ### 任务 2（P1）：私聊按需巡回群记忆（`recallGroupMemoryForPrivateV2`）性能与召回率升级
 - **现状痛点**：
   1. 当前 `recallGroupMemoryForPrivateV2` 在每次私聊唤醒时都会同步执行多次 `fs.readdirSync` / `fs.readFileSync` 读取 `summary.md`、`people/*.md` 与 `diary/*.md`。
-  2. `knownEntities` 中包含硬编码的群友昵称列表（如 `半瓶醋`、`Cyber马` 等），新群或新常驻群友无法自动享受高权重实体加分。
+  2. `knownEntities` 中包含硬编码的群友昵称列表，新群或新常驻群友无法自动享受高权重实体加分。
 - **优化要求**：
   1. **基于 `mtimeMs` 的内存索引缓存**：为每个 `group:*` 分舱建立基于文件修改时间的内存行缓存与解析后实体集合，文件未发生改动时零磁盘 I/O 直接内存检索。
   2. **动态实体词典提取**：自动从各群 `summary.md`、`people/*.md` 的反引号 `` `昵称` ``、粗体词条以及 `recentMessages` 发言人昵称中动态构建 `knownEntities` 及其 2 字尾缀别名，彻底移除代码中的硬编码人名列表。
-  3. **时间衰减与多群标识**：对 `diary/YYYY-MM-DD.md` 按日期新旧加入轻微时间衰减分（近期事件优先于旧账），并在输出条目前清晰标注群名称/群号（方便未来接入 `noa_group` 等多群时区分来源）。
+  3. **时间衰减与多群标识**：对 `diary/YYYY-MM-DD.md` 按日期新旧加入轻微时间衰减分（近期事件优先于旧账），并在输出条目前清晰标注群名称/群号（方便接入多个群时区分来源）。
 
 ### 任务 3（P2）：AGY Worker 断线重连自愈与僵尸回合清理
 - **现状痛点**：当外部 AGY 宿主重启或子代理偶发中断并重新拉起同一个 `workerId`（如 `w1`）时，如果旧 `w1` 恰好有一个已派发但未调用 `finish-turn` 的 `activeTurn`，该回合会一直占用并发槽位直到超时。
@@ -84,7 +84,7 @@ npm test
 node scripts/test-agy-bridge.mjs
 
 # 2. 验证私聊群记忆主动检索脚本
-node scripts/agy-recall-group.mjs "宝马" "半瓶醋"
+node scripts/agy-recall-group.mjs "镜头" "阿泽"
 
 # 3. 安全审计（保持 0 漏洞）
 npm audit --omit=dev

@@ -60,7 +60,7 @@ import {
   applyStickerNote,
   markStickerUsed
 } from './sticker-lib.js';
-import { synthesizeSpeech } from './tts.js';
+import { synthesizeSpeech, splitDrama3TextForTts } from './tts.js';
 import { recoverNapcatLogin, loginAttemptFile } from './napcat-login.js';
 import { napcatLoginConfig } from './napcat-config.js';
 import { runCodexDraw } from '../scripts/agy-codex-draw.mjs';
@@ -4971,8 +4971,8 @@ async function main() {
             }
             merged[sub] = { ...cfg.socialV2[sub], ...current[sub], ...delta };
           }
-          if (body.tts?.provider !== undefined && !['fish', 'elevenlabs', 'google'].includes(body.tts.provider)) {
-            sendJson({ ok: false, error: 'TTS 提供商应为 fish、google 或 elevenlabs' }, 400);
+          if (body.tts?.provider !== undefined && !['fish_local', 'fish', 'elevenlabs', 'google'].includes(body.tts.provider)) {
+            sendJson({ ok: false, error: 'TTS 提供商应为 fish_local、fish、google 或 elevenlabs' }, 400);
             return;
           }
           if (body.tts?.elevenlabs !== undefined) {
@@ -4990,6 +4990,14 @@ async function main() {
               return;
             }
             merged.tts.fish = { ...current.tts?.fish, ...fi };
+          }
+          if (body.tts?.fish_local !== undefined) {
+            const fl = body.tts.fish_local;
+            if (!fl || typeof fl !== 'object' || Array.isArray(fl)) {
+              sendJson({ ok: false, error: 'fish_local 配置格式无效' }, 400);
+              return;
+            }
+            merged.tts.fish_local = { ...current.tts?.fish_local, ...fl };
           }
           // 子对象必须是非 null 对象；null/数组/基本类型会覆盖默认值导致工具开关被绕过，这里直接保留当前值。
           for (const sub of ['tools', 'wake', 'send', 'wait', 'proactive', 'sticker', 'feedback', 'context']) {
@@ -5111,7 +5119,7 @@ async function main() {
                 merged.context[k] = Number.isFinite(n) ? Math.max(1, Math.round(n)) : current.context?.[k] ?? 20;
               }
             }
-            for (const [name, fallback, min, max] of [['wakeMessageLimit', 12, 1, 100], ['wakeRecentLimit', 4, 0, 20], ['wakeMaxChars', 6000, 500, 20000]]) {
+            for (const [name, fallback, min, max] of [['wakeMessageLimit', 12, 1, 100], ['wakeRecentLimit', 8, 0, 40], ['wakeMaxChars', 8000, 500, 30000]]) {
               const n = Number(merged.context[name] ?? fallback);
               merged.context[name] = Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
             }
@@ -6375,26 +6383,67 @@ async function main() {
               sendJson({ ok: false, error: '台词包含敏感信息，已拦截合成' }, 403);
               return;
             }
-            const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
+            const maxSegChars = Number(cfg.socialV2?.tts?.fish?.maxSegmentChars) || 150;
+            const segments = body.split === false ? [text] : splitDrama3TextForTts(text, maxSegChars);
             const ttsDir = path.join(STATE_DIR, 'tts');
-            const filePath = path.join(ttsDir, fileName);
-            let usedProvider;
+            fs.mkdirSync(ttsDir, { recursive: true });
+            const tempFiles = [];
+            const sentResults = [];
+            let usedProvider = '';
             try {
-              const sent = await sendVoiceForV2(key, fileName, {
-                label: '[语音] ' + text.slice(0, 80), verify: body.verify, guard, turn: body.turn,
-                prepare: async () => {
-                  const result = await synthesizeSpeech(text, cfg.socialV2.tts, body, voice.maxBytes);
-                  usedProvider = result.provider;
-                  fs.mkdirSync(ttsDir, { recursive: true });
-                  fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
-                  return filePath;
-                },
+              let nextSynthPromise = null;
+              for (let i = 0; i < segments.length; i += 1) {
+                const segText = segments[i];
+                const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
+                const filePath = path.join(ttsDir, fileName);
+                tempFiles.push(filePath);
+                const segLabel = segments.length > 1
+                  ? `[语音 ${i + 1}/${segments.length}] ${segText.slice(0, 80)}`
+                  : '[语音] ' + text.slice(0, 80);
+                const sent = await sendVoiceForV2(key, fileName, {
+                  label: segLabel,
+                  verify: body.verify,
+                  guard,
+                  turn: body.turn,
+                  prepare: async () => {
+                    // 仅在通过 sendVoiceForV2 的并发/额度/暂停校验后才启动合成，并为下一段流水线预热
+                    const curPromise = nextSynthPromise || synthesizeSpeech(segText, cfg.socialV2.tts, body, voice.maxBytes);
+                    if (i + 1 < segments.length) {
+                      nextSynthPromise = synthesizeSpeech(segments[i + 1], cfg.socialV2.tts, body, voice.maxBytes);
+                      nextSynthPromise.catch(() => {});
+                    } else {
+                      nextSynthPromise = null;
+                    }
+                    const result = await curPromise;
+                    usedProvider = result.provider;
+                    fs.mkdirSync(ttsDir, { recursive: true });
+                    fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
+                    return filePath;
+                  },
+                });
+                sentResults.push({
+                  file: fileName,
+                  messageId: sent.messageId,
+                  verified: sent.verification?.confirmed === true,
+                });
+              }
+              const lastSent = sentResults[sentResults.length - 1] || {};
+              sendJson({
+                ok: true,
+                key,
+                provider: usedProvider,
+                text,
+                segments: sentResults.length,
+                messageId: lastSent.messageId ?? null,
+                messageIds: sentResults.map((r) => r.messageId),
+                file: lastSent.file ?? '',
+                verified: sentResults.every((r) => r.verified),
               });
-              sendJson({ ok: true, key, provider: usedProvider, text, messageId: sent.messageId,
-                file: fileName, verified: sent.verification?.confirmed === true });
             } finally {
               // 网关返回消息 ID 后仍可能读取本地音频，给它留出原有的 15 秒窗口。
-              if (fs.existsSync(filePath)) setTimeout(() => { try { fs.unlinkSync(filePath); } catch {} }, 15000).unref();
+              for (const fp of tempFiles) {
+                if (fs.existsSync(fp)) setTimeout(() => { try { fs.unlinkSync(fp); } catch {} }, 15000).unref();
+              }
             }
             return;
           }
@@ -11371,9 +11420,10 @@ async function main() {
       const value = Number(context[name] ?? fallback);
       return Number.isFinite(value) ? Math.min(max, Math.max(min, Math.round(value))) : fallback;
     };
-    const maxChars = bounded('wakeMaxChars', 6000, 500, 20000);
+    const maxChars = bounded('wakeMaxChars', 8000, 500, 30000);
     const maxUnread = bounded('wakeMessageLimit', 12, 1, 100);
-    const maxRecent = bounded('wakeRecentLimit', claimSlice ? 6 : 4, 0, 20);
+    const isPrivateKey = String(key ?? '').startsWith('private:');
+    const maxRecent = bounded('wakeRecentLimit', isPrivateKey ? 12 : (claimSlice ? 6 : 4), 0, 40);
     const lastReadFloor = Number(st.lastReadThroughSeq) || 0;
     const prevClaimed = claimSlice ? getAgyClaimedSeq(key, st) : 0;
     const unreadSource = claimSlice
@@ -11423,7 +11473,10 @@ async function main() {
     }
     if (v2ToolEnabled('getRecent') && maxRecent > 0) {
       const excludeSeqs = new Set(unreadSource.map((m) => m.seq));
-      const recent = st.recentMessages.filter((m) => !Number.isSafeInteger(m.seq) || !excludeSeqs.has(m.seq)).slice(-maxRecent);
+      // 过滤掉自己发出的纯 [语音 ...] 占位记录（因每次发语音均已同步发送完整中文文本气泡），防止分段语音挤占上下文条数
+      const recent = st.recentMessages
+        .filter((m) => (!Number.isSafeInteger(m.seq) || !excludeSeqs.has(m.seq)) && !(m?.isSelf && /^\[语音/.test(String(m.text || m.plain || ''))))
+        .slice(-maxRecent);
       for (const msg of recent.reverse()) if (!tryAdd('recent', msg)) break;
       packet.recent.reverse();
     }
@@ -11466,7 +11519,7 @@ async function main() {
     const st = getSocialV2State(key);
     const isPrivateProactive = String(key).startsWith('private:') && reason === 'proactiveCheck';
     maybeEnqueueMemoryArchiveV2(key, st, isPrivateProactive
-      ? { force: true, minMessages: 5, triggerReason: 'proactiveCheck' }
+      ? { force: true, minMessages: 25, triggerReason: 'proactiveCheck' }
       : undefined);
     const isCompactWake = String(cfg.dsh?.baseUrl ?? '').startsWith('agy://') && reason !== 'bootstrap';
     const triggeredSeq = wakeReasonSeq(reason);
@@ -11480,10 +11533,10 @@ async function main() {
         && /[画图绘改像表情]/.test(String(m.plain || m.text || '')));
       const hasVoiceReq = Array.isArray(st.unread) && st.unread.some((m) => /(?:语音|说话|开口|声音|叫一[声下]|听.*声|发条语音|念一[下遍]|tts)/i.test(String(m?.plain || m?.text || '')));
       const drawHint = hasCreatorDrawReq
-        ? '\n【外包画图提示】Creator 若让画图/改图，同命令直接加 --codex-draw "20岁成年7.5头身修长美少女Nya（黑短发深钴蓝挑染、青蓝眼、黑猫耳卫衣）的自然全身/半身日常插画描述"（自动启用 selfRef；严禁用内置 generate_image，严禁写错发色瞳色或局部特写）。'
+        ? '\n【外包画图提示】Creator 若让画图/改图，同命令直接加 --codex-draw "{\"prompt\":\"详细画面描述\",\"selfRef\":true}"（自动挂载 persona.selfRefs 与 appearanceAnchor；勿用内置 generate_image）。'
         : '';
       const voiceHint = hasVoiceReq && voiceCfg().enabled && v2ToolEnabled('sendVoice') && ttsEnabled()
-        ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "[色っぽく艶のある甘い吐息交じりの声で、小悪魔っぽくからかうように] 日语タメ口短句（单条控制在15~38字以内，长句传多个 --tts 分句发送；耳语用 <whisper>...</whisper>、放软用 <soft>...</soft>）"，且【必须同时带上对应的中文文本消息】（严禁只发 --tts 不发中文文字）！'
+        ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "[色っぽく艶のある甘い吐息交じりの声で、小悪魔っぽくからかうように] 日语タメ口台词（单条字数不做硬性限制，15秒内完整句群放在同一个 --tts 里一口气说完，严禁在逗号处拆句；耳语用 <whisper>...</whisper>、放软用 <soft>...</soft>）"，且【必须同时带上对应的中文文本消息】（严禁只发 --tts 不发中文文字）！'
         : '';
       const groupRecallHint = String(key ?? '').startsWith('private:')
         ? recallGroupMemoryForPrivateV2(key, st)
@@ -11940,7 +11993,7 @@ async function main() {
       clearWorkerHotReloadSigsV2(wid);
       for (const [k, st] of socialV2.conversations.entries()) {
         const isPriv = String(k).startsWith('private:');
-        maybeEnqueueMemoryArchiveV2(k, st, { force: isPriv, minMessages: isPriv ? 5 : 10, triggerReason: `rotate:${wid || 'worker'}` });
+        maybeEnqueueMemoryArchiveV2(k, st, { force: isPriv, minMessages: isPriv ? 25 : 80, triggerReason: `rotate:${wid || 'worker'}` });
       }
     };
   }
@@ -12811,8 +12864,9 @@ async function main() {
                   wakeConfigMissCount.delete(key);
                 } else {
                   const currentMiss = (wakeConfigMissCount.get(key) ?? 0) + 1;
-                  const maxReminders = Number(cfg.socialV2?.wake?.maxWakeConfigReminders) || 2;
-                  if (currentMiss < maxReminders) {
+                  const rawMaxRem = Number(cfg.socialV2?.wake?.maxWakeConfigReminders);
+                  const maxReminders = Number.isFinite(rawMaxRem) ? rawMaxRem : 0;
+                  if (ended.reason.kind !== 'aborted' && currentMiss <= maxReminders && maxReminders > 0) {
                     wakeConfigMissCount.set(key, currentMiss);
                     pendingWakeKeys.add(key);
                     armPendingWakeLease(key);
@@ -12828,10 +12882,13 @@ async function main() {
                     });
                     log(`[reserved2] ${key} 未设置唤醒条件，发送提醒 (${currentMiss}/${maxReminders})`);
                   } else {
+                    wakeConfigMissCount.delete(key);
                     const st = getSocialV2State(key);
-                    st.wakeConfig = defaultWakeConfigV2();
-                    saveSocialV2State();
-                    log(`[reserved2] ${key} 连续未设置唤醒条件，已重置为默认唤醒配置`);
+                    if (!st.wakeConfig) {
+                      st.wakeConfig = defaultWakeConfigV2();
+                      saveSocialV2State();
+                    }
+                    log(`[reserved2] ${key} 回合未显式更新唤醒条件，保持当前/默认唤醒配置`);
                   }
                 }
               }
@@ -12968,7 +13025,9 @@ async function main() {
                 // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
                 appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
-                await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                if (currentMode !== 'reserved2') {
+                  await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                }
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
@@ -12980,7 +13039,9 @@ async function main() {
                 }
               } else if (ended.reason.kind === 'aborted') {
                 log(`⏹️ 回合被中止 (${key})`);
-                await sendToQQ(key, '⏹️ 已停止');
+                if (currentMode !== 'reserved2') {
+                  await sendToQQ(key, '⏹️ 已停止');
+                }
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {

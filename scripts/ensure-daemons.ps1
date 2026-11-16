@@ -206,3 +206,31 @@ if (-not (Test-LocalPort $qrPortalPort)) {
 } else {
   Write-Host "[ensure-daemons] qr-portal-daemon (:$qrPortalPort) already running."
 }
+
+# 4. Ensure Local Drama 3 TTS Daemon (:17864) when provider or fallback is fish_local
+$ttsCfg = $BridgeCfg.socialV2.tts
+if ($ttsCfg -and ($ttsCfg.provider -eq 'fish_local' -or $ttsCfg.fallbackProvider -eq 'fish_local')) {
+  $localTtsPort = 17864
+  if ($ttsCfg.fish_local -and $ttsCfg.fish_local.baseUrl) {
+    try { $localTtsPort = ([uri]$ttsCfg.fish_local.baseUrl).Port } catch {}
+  }
+  $localCmdBat = if ($ttsCfg.fish_local -and $ttsCfg.fish_local.launchCmd) { [string]$ttsCfg.fish_local.launchCmd } else { '' }
+  $localLockFile = if ($ttsCfg.fish_local -and $ttsCfg.fish_local.stopLockPath) { [string]$ttsCfg.fish_local.stopLockPath } else { Join-Path $Root 'state\drama3-manual-stop.lock' }
+  if (Test-Path -LiteralPath $localLockFile) {
+    Write-Host "[ensure-daemons] local Drama 3 TTS paused by $localLockFile, skipping auto-start."
+  } elseif (-not (Test-LocalPort $localTtsPort) -and (Test-Path -LiteralPath $localCmdBat)) {
+    Write-Host "[ensure-daemons] Starting hidden local Drama 3 TTS (:$localTtsPort) via WMI (ShowWindow=0)..."
+    $r4 = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{
+      CommandLine = "cmd.exe /c `"$localCmdBat`""
+      CurrentDirectory = (Split-Path -Parent $localCmdBat)
+      ProcessStartupInformation = $si
+    }
+    Write-Host "[ensure-daemons] local Drama 3 WMI launch ReturnValue=$($r4.ReturnValue) PID=$($r4.ProcessId)"
+    for ($i = 0; $i -lt 16; $i++) {
+      Start-Sleep -Milliseconds 500
+      if (Test-LocalPort $localTtsPort) { break }
+    }
+  } elseif (Test-LocalPort $localTtsPort) {
+    Write-Host "[ensure-daemons] local Drama 3 TTS (:$localTtsPort) already running."
+  }
+}

@@ -19,7 +19,7 @@ test('离线唤醒从领取时计时，取消和结清的任务离开待领队�
   const cancelled = await prompt('cancel');
   const waiting = await prompt('waiting');
   client.completeTurn({ turn: cancelled });
-  client._activeTurns.get(waiting).startedAt -= 80_000;
+  client._activeTurns.get(waiting).startedAt -= 185_000;
   assert.equal(client.activeTurnCount('waiting'), 1);
   const { wake } = await client.waitNextWake({ workerId: 'w1' });
   assert.equal(wake.turn, waiting);
@@ -30,7 +30,7 @@ test('离线唤醒从领取时计时，取消和结清的任务离开待领队�
   assert.ok(client.isTurnActive(waiting, 'waiting'));
   assert.equal(client.isTurnActive(waiting, 'cancel'), false);
   assert.equal(client.agyStatus().queuedWakes, 0);
-  client._activeTurns.get(waiting).startedAt -= 80_000;
+  client._activeTurns.get(waiting).startedAt -= 185_000;
   assert.ok(client.isTurnCompleted(waiting));
   assert.equal(client.activeTurnCount(), 0);
   const stopped = await prompt('stop');

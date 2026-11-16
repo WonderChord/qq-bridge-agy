@@ -7,17 +7,17 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
 1. `config.json → dsh.baseUrl` 设为 `agy://local`。
 2. 按下文填好 `persona`、`napcat`，可选 `socialV2.tts` 与 `codexDraw`。
 3. 安装插件：`powershell -ExecutionPolicy Bypass -File agy-plugin/install.ps1`，在 Antigravity 插件管理里启用 `qq-bridge`。
-4. 新开一个干净的 Antigravity 窗口，说「启动 QQ 机器人全自动值守」，总控会按 `qq-bot-operator` 技能拉起三个子代理。
+4. 新开一个干净的 Antigravity 窗口（推荐选用 `Gemini 4 Carbon (Low)` 档位以兼顾细腻文笔与低思考开销；步数超过 80 步后建议 `/compact` 或换新总控窗口），说「启动 QQ 机器人全自动值守」，总控会按 `qq-bot-operator` 技能拉起三个子代理。
 
-新安装默认进入二代仿真模式。已有安装沿用控制台保存的模式，使用值守 Worker 时选择「二代仿真」。控制台的「聊天后端」显示待命数、处理数和积压数。
+新安装默认进入二代仿真模式。已有安装沿用控制台保存的模式，使用值守 Worker 时选择「二代仿真」。控制台的「聊天后端」显示待命数、处理数和积压数，也可随时运行 `node scripts/bridge-status.mjs` 体检全链路状态。
 
-## 线程分工
+## 线程分工与省流机制
 
-| 子代理 | 模型 | 作用 | 换新 |
+| 子代理 | 模型 | 作用 | 换新上限 |
 |---|---|---|---|
-| `qq-chat-worker`（w1） | inherit | 承接全部唤醒，`agy-reply-and-wait.mjs` 一次完成文字/表情/语音/画图/标已读 | 25 轮 |
-| `qq-flash-judge` | flash | 名字/模糊称呼命中与潜水概率抽样的 yes/no 预筛 | 30 轮 |
-| `qq-memory-archivist` | flash | 分舱长期记忆归纳（群 150 条 / 私聊 40 条一次） | 不换 |
+| `qq-chat-worker`（w1） | `inherit` | 单线程承接全部唤醒以维持 5 分钟 KV Cache，按会话 `seenSeq` 游标增量补齐群聊潜水上下文与跨会话纯文字锚点，`agy-reply-and-wait.mjs` 一次完成文字/表情/语音/画图/标已读 | 30 轮（沉浸扮演 20 轮） |
+| `qq-flash-judge` | `flash` | 名字/模糊称呼命中与潜水概率抽样的 yes/no 预筛（支持 `--auto-flash` 直连本机反代） | 60 轮 |
+| `qq-memory-archivist` | `inherit` | 分舱长期记忆归纳（群 200 条 / 私聊 35 条一次，支持 `event_book.md` 无损沉淀），**满 4 批强制换新清零上下文**防滚雪球烧额度 | 4 批 |
 
 ## `persona`：人设与身份
 
@@ -86,7 +86,7 @@ qq-bridge 可以把 Antigravity 当作聊天大脑：网桥负责收消息、合
     "fish": {
       "model": "drama-3",
       "apiKeyEnv": "FISH_API_KEY",
-      "referenceDir": "audio/nya_aris_ref/restored_48k",
+      "referenceDir": "audio/references/restored_48k",
       "mp3Bitrate": 192,
       "temperature": 0.7,
       "topP": 0.7
