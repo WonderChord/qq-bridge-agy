@@ -1,9 +1,10 @@
-// qq-bridge 实时线程、宿主终端与模型状态体检脚本
+// qq-bridge 实时线程、宿主终端与前置路由状态体检脚本
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { execFileSync } from 'node:child_process';
-import { ROOT, loadConfig } from './bridge-local.mjs';
+import { ROOT, loadConfig, readConsoleToken } from './bridge-local.mjs';
+import { resolveRouterConfig } from '../src/message-router.js';
 
 function checkPort(port, host = '127.0.0.1', timeoutMs = 1000) {
   return new Promise((resolve) => {
@@ -23,33 +24,34 @@ function checkPort(port, host = '127.0.0.1', timeoutMs = 1000) {
   });
 }
 
-function readJsonSafe(filePath) {
+function getAllProcesses() {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const ps = 'Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine | ConvertTo-Json -Depth 2 -Compress';
+    const raw = execFileSync('powershell.exe', ['-NoProfile', '-Command', ps], {
+      encoding: 'utf8',
+      windowsHide: true,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [parsed];
   } catch {
-    return null;
+    return [];
   }
 }
 
-function getAllProcesses() {
+function readJsonSafe(p) {
   try {
-    const psCmd = 'Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId, Name, CreationDate, CommandLine | ConvertTo-Json -Compress';
-    const raw = execFileSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psCmd], {
-      encoding: 'utf8',
-      maxBuffer: 32 * 1024 * 1024,
-      windowsHide: true,
-    });
-    const arr = JSON.parse(raw);
-    return Array.isArray(arr) ? arr : [arr];
+    if (!fs.existsSync(p)) return null;
+    return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch {
-    return [];
+    return null;
   }
 }
 
 function detectHostOwner(proc, byPid) {
   let cur = proc;
   const chain = [];
-  for (let depth = 0; depth < 10 && cur; depth += 1) {
+  for (let i = 0; i < 10 && cur; i += 1) {
     const name = String(cur.Name || '').toLowerCase();
     const cmd = String(cur.CommandLine || '');
     chain.push(`${cur.Name}(${cur.ProcessId})`);
@@ -59,120 +61,127 @@ function detectHostOwner(proc, byPid) {
         const st = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'codex-driver.json'), 'utf8'));
         model = [st.model, st.effort, st.profile].filter(Boolean).join(' ');
       } catch {}
-      return `Codex 驱动器 codex-driver (PID ${cur.ProcessId}${model ? `, ${model}` : ''})`;
+      return `Codex 守护驱动器 codex-driver (PID ${cur.ProcessId}${model ? `, ${model}` : ''})`;
     }
     if (name === 'claude.exe' || /claude-code/i.test(cmd)) {
       const m = cmd.match(/--model=([^\s"]+)/);
-      const reqModel = m ? m[1] : 'claude-code';
-      const mapped = /opus-5/i.test(reqModel) ? `${reqModel} -> gemini-4-carbon` : reqModel;
-      return `Claude Desktop / Code [${mapped}]`;
+      return `Claude Code (PID ${cur.ProcessId}${m ? `, model=${m[1]}` : ''})`;
     }
-    if (name.includes('antigravity') || name.includes('language_server')) {
-      return 'Antigravity (AGY 子代理面板)';
+    if (name === 'codex.exe') {
+      return `Codex CLI (PID ${cur.ProcessId})`;
     }
-    cur = byPid.get(Number(cur.ParentProcessId));
+    if (name.includes('antigravity') || cmd.includes('.gemini\\antigravity') || cmd.includes('antigravity')) {
+      return `Antigravity IDE (PID ${cur.ProcessId})`;
+    }
+    cur = byPid.get(cur.ParentProcessId);
   }
-  return `独立后台进程 (${chain.slice(0, 2).join(' <- ')})`;
+  return `独立后台 / 终端已脱离 (${chain.join(' <- ')})`;
 }
 
 function classifyListener(cmd) {
-  if (/agy-wait-wake\.mjs|agy-reply-and-wait\.mjs/i.test(cmd)) {
+  if (/agy-(wait-wake|reply-and-wait)\.mjs/i.test(cmd)) {
     const wid = (cmd.match(/--worker-id\s+([^\s"]+)/) || [])[1] || 'primary';
     const isReply = /agy-reply-and-wait\.mjs/i.test(cmd);
     return {
-      role: `w1 聊天线程 (${wid})`,
+      role: `w1 主对话线程 (${wid})`,
       key: `worker:${wid}`,
       detail: isReply ? '已回信并继续挂起监听' : '初始挂起监听',
     };
   }
-  if (/agy-wait-judge\.mjs/i.test(cmd)) {
-    const isAutoFlash = /--auto-flash/i.test(cmd);
-    const model = cmd.match(/\s--model\s+"?([^\s"]+)/)?.[1];
-    const route = model ? `${model}（订阅反代 :8788）` : 'gemini-3.8-flash（:8787 / :8788）';
-    return {
-      role: 'judge 预筛门控',
-      key: 'judge',
-      detail: isAutoFlash
-        ? `--auto-flash 常驻直连 ${route}`
-        : '会话唤醒模式（触发时唤醒父会话模型！）',
-    };
-  }
   if (/agy-wait-archive\.mjs/i.test(cmd)) {
     return {
-      role: 'archivist 记忆归档监听',
+      role: 'archivist 本地记忆归档监听',
       key: 'archivist',
-      detail: '达到阈值后启动一次性归档任务',
+      detail: '达到阈值后在本地触发分舱记忆归档',
     };
   }
   return null;
 }
 
+async function fetchAgyStatus(cfg) {
+  const port = Number(cfg?.consolePort) || 3100;
+  const token = readConsoleToken(cfg);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/api/agy/status`, {
+      headers: token ? { 'x-console-token': token } : {},
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
 async function main() {
   const cfg = loadConfig();
-  const [napcatOk, bridgeOk, ttsOk, relay8787Ok, relay8788Ok] = await Promise.all([
+  const routerCfg = resolveRouterConfig({ rootDir: ROOT, env: process.env, cfg });
+  const consolePort = Number(cfg.consolePort) || 3100;
+  const [napcatOk, bridgeOk, ttsOk, agyStatus] = await Promise.all([
     checkPort(3000),
-    checkPort(Number(cfg.consolePort) || 3100),
+    checkPort(consolePort),
     checkPort(17864),
-    checkPort(8787),
-    checkPort(8788),
+    fetchAgyStatus(cfg),
   ]);
 
   const procs = getAllProcesses();
-  const byPid = new Map(procs.map((p) => [Number(p.ProcessId), p]));
+  const byPid = new Map(procs.map((p) => [p.ProcessId, p]));
 
   const listeners = [];
   for (const p of procs) {
-    if (!/^node(\.exe)?$/i.test(String(p.Name || ''))) continue;
+    if (String(p.Name || '').toLowerCase() !== 'node.exe') continue;
     const cmd = String(p.CommandLine || '');
     const info = classifyListener(cmd);
     if (!info) continue;
     listeners.push({
       pid: p.ProcessId,
-      role: info.role,
-      key: info.key,
-      owner: detectHostOwner(p, byPid),
-      detail: info.detail,
+      ppid: p.ParentProcessId,
+      ...info,
+      host: detectHostOwner(p, byPid),
     });
   }
 
   const workerTurns = readJsonSafe(path.join(ROOT, 'state', 'agy-worker-turns.json')) || {};
-  const judgeState = readJsonSafe(path.join(ROOT, 'state', 'agy-judge-turns.json')) || {};
   const archiveCursor = readJsonSafe(path.join(ROOT, 'state', 'agy-archive-cursor.json')) || {};
 
-  console.log('=== qq-bridge 实时线程与模型状态 ===\n');
+  console.log('=== qq-bridge 实时服务与工作线程状态 ===\n');
   console.log('[1] 底层常驻服务');
-  console.log(`  - NapCat QQ (${cfg?.napcat?.account || '未配置账号'} :3000) : ${napcatOk ? 'ONLINE' : 'OFFLINE'}`);
-  console.log(`  - qq-bridge 主网桥 (:3100)            : ${bridgeOk ? 'ONLINE' : 'OFFLINE'}`);
-  console.log(`  - 本地 Drama3 语音 (:17864)          : ${ttsOk ? `ONLINE (${cfg?.socialV2?.tts?.fish_local?.model || 'drama3'})` : 'OFFLINE (回退云端 API)'}`);
-  console.log(`  - Gemini 本地反代 (:8787 / :8788)     : ${relay8787Ok || relay8788Ok ? `ONLINE (8787=${relay8787Ok ? 'UP' : 'DOWN'}, 8788=${relay8788Ok ? 'UP' : 'DOWN'})` : 'OFFLINE'}`);
+  console.log(`  - NapCat 消息网关 (${cfg?.napcat?.account || '未配置账号'} :3000) : ${napcatOk ? 'ONLINE' : 'OFFLINE'}`);
+  console.log(`  - qq-bridge 主网桥 (:${consolePort})             : ${bridgeOk ? 'ONLINE' : 'OFFLINE'}`);
+  console.log(`  - 本地 Drama3 语音 (:17864)              : ${ttsOk ? `ONLINE (${cfg?.socialV2?.tts?.fish_local?.model || 'drama3'})` : 'OFFLINE (回退云端 API)'}`);
+  console.log(`  - 前置分流配置 (.env)                    : 群聊路由模型=${routerCfg.model} (Key=${routerCfg.hasApiKey ? '已配置' : '未配置'}) | 私聊白名单=${routerCfg.ownerIds.length} 个账号`);
 
-  console.log(`\n[2] 当前活跃监听线程（共 ${listeners.length} 个）`);
+  console.log(`\n[2] 当前活跃本地监听线程（共 ${listeners.length} 个）`);
   if (listeners.length === 0) {
-    console.log('  (当前没有任何挂起的监听线程！机器人不会回复消息)');
+    console.log('  (当前没有挂起的监听线程！机器人不会回复消息)');
   } else {
     const counts = {};
     for (const l of listeners) {
       counts[l.key] = (counts[l.key] || 0) + 1;
-      console.log(`  - [PID ${l.pid}] ${l.role}`);
-      console.log(`      宿主终端 : ${l.owner}`);
-      console.log(`      工作模式 : ${l.detail}`);
+      console.log(`  - [PID ${String(l.pid).padEnd(6)}] ${l.role.padEnd(26)} | ${l.detail}`);
+      console.log(`      所属宿主: ${l.host}`);
     }
     const dupes = Object.entries(counts).filter(([, c]) => c > 1);
     if (dupes.length > 0) {
-      console.log(`\n  ⚠️ 警告：检测到重复监听线程 (${dupes.map(([k, c]) => `${k}x${c}`).join(', ')})，建议重新执行 qq-bot-operator 清场！`);
+      console.log(`\n  ⚠️ 警告：检测到重复监听线程 (${dupes.map(([k, c]) => `${k}x${c}`).join(', ')})，建议按 qq-bot-operator 规程清理旧线程！`);
     }
   }
 
-  console.log('\n[3] 累计轮次与最近模型核验');
-  console.log(`  - w1 聊天累计轮次      : ${workerTurns.w1 ?? 0} 轮`);
-  console.log(`  - 记忆归档最新批次     : #${archiveCursor.counter ?? 0}`);
-  console.log(`  - judge 预筛模式/轮次  : ${judgeState.mode || '未知'} | 累计 ${judgeState.turns ?? 0} 次`);
-  if (judgeState.lastDecision) {
-    const d = judgeState.lastDecision;
-    console.log(`  - 最近一次预筛实测     : 模型=${d.model} (${d.endpoint}, ${d.latencyMs}ms) | 结果=${d.wake} | 原因=${d.reason} | 触发="${d.target}"`);
-  } else {
-    console.log('  - 最近一次预筛实测     : 本次启动后暂未触发预筛事件');
+  console.log('\n[3] 累计轮次与前置路由记录');
+  console.log(`  - w1 主对话累计轮次    : ${workerTurns.w1 ?? 0} 轮`);
+  console.log(`  - 本地记忆归档最新批次 : #${archiveCursor.counter ?? 0}`);
+  if (agyStatus) {
+    console.log(`  - 网桥群聊路由累计次数 : ${agyStatus.totalRouted ?? 0} 次 (在途 ${agyStatus.inFlightRouters ?? 0})`);
+    if (agyStatus.lastRouterDecision) {
+      const d = agyStatus.lastRouterDecision;
+      console.log(`  - 最近一次群聊路由判定 : 模型=${d.model} (${d.endpoint}, ${d.latencyMs}ms) | should_reply=${d.should_reply} | 触发=${d.trigger} | 原因="${d.reason}"`);
+    } else {
+      console.log('  - 最近一次群聊路由判定 : 本次网桥启动后暂未触发群聊路由');
+    }
   }
 }
 
-main();
+main().catch((e) => {
+  console.error('体检脚本执行出错:', e);
+  process.exit(1);
+});

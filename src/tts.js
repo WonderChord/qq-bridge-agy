@@ -628,7 +628,7 @@ async function getOrEncodeLocalVqReference(baseUrl, model, chosenRef, localCfg =
   return entry;
 }
 
-// 根据 Drama 3 台词中的演技指令、局部尖括号标签或显式指定，智能匹配最贴合的 48kHz 睦月参考音频
+// 根据 Drama 3 台词中的演技指令、局部尖括号标签或显式指定，智能匹配最贴合的 48kHz 情绪参考音频
 export function selectArisReference(text, preferredRef, refs) {
   if (!Array.isArray(refs) || refs.length === 0) return null;
   const pref = String(preferredRef || '').trim().toLowerCase();

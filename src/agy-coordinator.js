@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import { buildRouterInput, classifyGroupMessageWithRouter, DEFAULT_ROUTER_MODEL } from './message-router.js';
 
 const AGY_WORKER_TURNS_FILE = fileURLToPath(new URL('../state/agy-worker-turns.json', import.meta.url));
 
@@ -34,6 +35,10 @@ export class AgyApiClient {
     this._loadWorkerTurns();
     this.onWorkerAvailable = null;
     this.onWorkerRotated = null;
+    this._pruneTimer = setInterval(() => {
+      try { this._pruneStaleTurns(); } catch {}
+    }, 30000);
+    this._pruneTimer.unref?.();
 
     const ok = (value = {}) => ({ result: { ok: true, value } });
 
@@ -114,7 +119,7 @@ export class AgyApiClient {
           this._assignWake(item, bestWaiter.workerId);
           bestWaiter.deliver(item);
         } else {
-          this._wakeQueue.push(item);
+          this._enqueueWake(item);
         }
         return ok({ turn });
       },
@@ -171,12 +176,59 @@ export class AgyApiClient {
     return { result: { ok: true, value: {} } };
   }
 
-  _pruneStaleTurns(maxAgeMs = 180000) {
+  _isPrivateWakeItem(item) {
+    return /(?:^|\n)【唤醒】private:|private:\d+/.test(String(item?.text || ''));
+  }
+
+  _enqueueWake(item) {
+    if (this._isPrivateWakeItem(item)) {
+      let insertAt = 0;
+      while (insertAt < this._wakeQueue.length && this._isPrivateWakeItem(this._wakeQueue[insertAt])) {
+        insertAt += 1;
+      }
+      this._wakeQueue.splice(insertAt, 0, item);
+      return;
+    }
+    this._wakeQueue.push(item);
+  }
+
+  touchSessionTurns(sessionId) {
+    if (!sessionId) return;
+    const now = Date.now();
+    for (const info of this._activeTurns.values()) {
+      if (info.sessionId === sessionId && info.workerId) {
+        info.startedAt = now;
+      }
+    }
+  }
+
+  _pruneStaleTurns(maxAgeMs = 600000) {
     const now = Date.now();
     const expiredSids = new Map();
+    const recoveredItems = [];
     for (const [t, info] of this._activeTurns.entries()) {
-      // 离线积压仍可领取，执行租约从 worker 领到唤醒时开始。
+      // 离线积压仍可领取，执行租约从 worker 领到唤醒时开始（默认 10 分钟，工具调用自动续期；看图后上游卡死时自动回收重排）。
       if (info.workerId && now - info.startedAt > maxAgeMs) {
+        const snapshot = this._snapshots.get(info);
+        if (!info.claimed && snapshot && (Number(snapshot.requeuedCount) || 0) < 2) {
+          const nextTurn = 'agy-turn-' + randomUUID();
+          const recovery = this.onRecoverTurn?.(info, nextTurn);
+          if (recovery && recovery !== 'acknowledged') {
+            const item = {
+              ...snapshot,
+              wakeId: randomUUID(),
+              turn: nextTurn,
+              requeuedCount: (Number(snapshot.requeuedCount) || 0) + 1,
+            };
+            const next = { turn: nextTurn, sessionId: info.sessionId, wakeId: item.wakeId, workerId: '', startedAt: now };
+            this._completedTurns.set(t, now);
+            this._activeTurns.delete(t);
+            this._activeTurns.set(nextTurn, next);
+            this._snapshots.set(next, item);
+            recoveredItems.push(item);
+            continue;
+          }
+        }
         this._activeTurns.delete(t);
         this._completedTurns.set(t, now);
         expiredSids.set(info.sessionId, t);
@@ -188,6 +240,15 @@ export class AgyApiClient {
     for (const [sid, turn] of expiredSids) {
       if (![...this._activeTurns.values()].some((entry) => entry.sessionId === sid)) {
         this._endSessionTurn(sid, turn, 'aborted');
+      }
+    }
+    for (const item of recoveredItems) {
+      const bestWaiter = this._pickBestWaiter();
+      if (bestWaiter) {
+        this._assignWake(item, bestWaiter.workerId);
+        bestWaiter.deliver(item);
+      } else {
+        this._enqueueWake(item);
       }
     }
   }
@@ -219,7 +280,12 @@ export class AgyApiClient {
         continue;
       }
       const now = Date.now();
-      const item = { ...snapshot, wakeId: randomUUID(), turn };
+      const item = {
+        ...snapshot,
+        wakeId: randomUUID(),
+        turn,
+        requeuedCount: (Number(snapshot.requeuedCount) || 0) + 1,
+      };
       const next = { turn, sessionId: old.sessionId, wakeId: item.wakeId, workerId: '', startedAt: now };
       this._completedTurns.set(old.turn, now);
       this._activeTurns.delete(old.turn);
@@ -229,6 +295,84 @@ export class AgyApiClient {
     }
     this._wakeQueue.unshift(...retry);
     return retry.length;
+  }
+
+  requeueTurn({ turn, workerId = '' } = {}) {
+    this._pruneStaleTurns();
+    const targetTurn = String(turn || '').trim();
+    const wid = String(workerId || '').trim();
+    const candidates = [];
+    for (const old of [...this._activeTurns.values()]) {
+      if (targetTurn && old.turn === targetTurn) candidates.push(old);
+      else if (!targetTurn && wid && old.workerId === wid) candidates.push(old);
+    }
+    const requeued = [];
+    for (const old of candidates) {
+      const snapshot = this._snapshots.get(old);
+      if (!snapshot) continue;
+      const nextTurn = 'agy-turn-' + randomUUID();
+      const recovery = this.onRecoverTurn?.(old, nextTurn);
+      if (recovery === false) continue;
+      if (recovery === 'acknowledged') {
+        this.completeTurn({ turn: old.turn });
+        continue;
+      }
+      const now = Date.now();
+      const item = {
+        ...snapshot,
+        wakeId: randomUUID(),
+        turn: nextTurn,
+        requeuedCount: (Number(snapshot.requeuedCount) || 0) + 1,
+      };
+      const next = { turn: nextTurn, sessionId: old.sessionId, wakeId: item.wakeId, workerId: '', startedAt: now };
+      this._completedTurns.set(old.turn, now);
+      this._activeTurns.delete(old.turn);
+      this._activeTurns.set(nextTurn, next);
+      this._snapshots.set(next, item);
+      requeued.push(item);
+    }
+    if (wid) {
+      this._workerTurns.set(wid, 0);
+      this._saveWorkerTurns();
+      this.onWorkerRotated?.(wid);
+    }
+    if (requeued.length > 0) {
+      this._wakeQueue.unshift(...requeued);
+      while (this._wakeQueue.length > 0) {
+        let best = null;
+        for (const w of this._wakeWaiters) {
+          if (wid && w.workerId === wid) continue;
+          if (!best || (w.priority ?? 0) > (best.priority ?? 0)) best = w;
+        }
+        if (!best) break;
+        const item = this._wakeQueue.shift();
+        this._assignWake(item, best.workerId);
+        best.deliver(item);
+      }
+    }
+    return { requeued: requeued.length, turns: requeued.map((x) => x.turn) };
+  }
+
+  forceRotateWorker(workerId = 'w1') {
+    const wid = String(workerId || 'w1').trim() || 'w1';
+    const prevTurns = this._workerTurns.get(wid) || 0;
+    let wokeWaiter = false;
+    for (const existing of [...this._wakeWaiters]) {
+      if (existing.workerId === wid && typeof existing.rotateNow === 'function') {
+        existing.rotateNow(prevTurns || 1);
+        wokeWaiter = true;
+      }
+    }
+    if (wokeWaiter) {
+      this._workerTurns.set(wid, 0);
+      this._saveWorkerTurns();
+      this.onWorkerRotated?.(wid);
+    } else {
+      // 若当前线程不在挂起监听态（正在跑回合或重连间隙），置高计数使其下次连入 wait 时立即收到 rotate: true
+      this._workerTurns.set(wid, 999);
+      this._saveWorkerTurns();
+    }
+    return { workerId: wid, wokeWaiter, prevTurns };
   }
 
   _pickBestWaiter() {
@@ -438,6 +582,13 @@ export class AgyApiClient {
           self._wakeWaiters.delete(entry);
           resolve({ timedOut: false, superseded: true, wake: null });
         },
+        rotateNow(turnsCompleted = 1) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          self._wakeWaiters.delete(entry);
+          resolve({ timedOut: false, rotate: true, turnsCompleted, wake: null });
+        },
         cancel() {
           if (settled) return;
           settled = true;
@@ -482,21 +633,17 @@ export class AgyApiClient {
 }
 
 
-// 群聊预筛与主 Worker 分开排队，只在 Flash 通过时唤醒主线程。
+// 群聊前置路由分类器（在 qq-bridge 本地脚本层直接调用 gpt-6-luna / ROUTER_MODEL 进行无推理轻量判定）。
 export function createFlashJudge({
   api, log, scheduleWakeV2, getSocialV2State, isConversationBusyV2, acknowledgeMessagesV2,
-  saveSocialV2State, isPaused, isCreator, personaCreatorLabel, localClockText, personaBotName,
+  saveSocialV2State, isPaused, isCreator, localClockText,
+  getRouterConfig, getAssistantAliases, getSelfQqId, fetchImpl,
 }) {
-  let ambiguousJudgeCounter = 0;
-  const ambiguousJudgeQueue = [];
-  const ambiguousJudgeInFlight = new Map();
-  const ambiguousJudgeWaiters = new Set();
-  const ambiguousJudgeCooldown = new Map();
-  let lastJudgePollAt = 0;
-
-  function isFlashJudgeOnlineV2() {
-    return ambiguousJudgeWaiters.size > 0 || (lastJudgePollAt > 0 && Date.now() - lastJudgePollAt < 75000);
-  }
+  let inFlightRouters = 0;
+  let totalRouted = 0;
+  let lastDecision = null;
+  let cancelGeneration = 0;
+  const keyGenerations = new Map();
 
   function cancelFlashReplyJudgeV2(key, st) {
     if (st?.pendingFlashJudgeTimer) {
@@ -506,173 +653,292 @@ export function createFlashJudge({
     if (st) {
       st.pendingFlashJudgeReason = null;
       st.pendingFlashJudgeTargetText = '';
+      st.pendingRouterExplicitAtSelf = false;
+      st.pendingRouterQuoteSelf = false;
+      st.pendingRouterSenderIsAdmin = false;
+      st.pendingRouterSenderLabel = '';
     }
-    for (let i = ambiguousJudgeQueue.length - 1; i >= 0; i -= 1) {
-      if (ambiguousJudgeQueue[i]?.key === key) ambiguousJudgeQueue.splice(i, 1);
-    }
-    for (const [id, item] of ambiguousJudgeInFlight.entries()) {
-      if (item?.key === key) ambiguousJudgeInFlight.delete(id);
-    }
-  }
-
-  function pruneAmbiguousJudge() {
-    const now = Date.now();
-    while (ambiguousJudgeQueue.length > 0 && now - ambiguousJudgeQueue[0].createdAtMs > 25000) {
-      ambiguousJudgeQueue.shift();
-    }
-    for (const [id, item] of ambiguousJudgeInFlight.entries()) {
-      if (now - item.createdAtMs > 45000) ambiguousJudgeInFlight.delete(id);
+    if (key) {
+      keyGenerations.set(key, ++cancelGeneration);
     }
   }
 
-  function applyAmbiguousJudgeDecision(decideId, shouldWake) {
-    if (!decideId) return null;
-    const item = ambiguousJudgeInFlight.get(decideId);
-    ambiguousJudgeInFlight.delete(decideId);
-    if (!item) return { found: false };
-    if (shouldWake && Date.now() - item.createdAtMs <= 45000) {
-      log(`[reserved2] Flash 预筛通过 ${item.key} (${decideId}, reason=${item.reason || 'probability'}) -> 唤醒主力回复`);
-      scheduleWakeV2(item.key, `${item.reason || 'probability'}:Flash预筛可回`, { immediate: true });
-      return { found: true, woke: true, key: item.key };
-    }
+  function flashJudgePriorityV2(reason) {
+    const base = String(reason || '').split(':')[0];
+    if (base === 'atMention') return 45;
+    if (base === 'anyMessage') return 40;
+    if (base === 'nameMention') return 35;
+    if (base === 'keyword') return 30;
+    if (base === 'question' || base === 'speaker' || base === 'followup') return 25;
+    if (base === 'ambiguousCall') return 20;
+    return 10;
+  }
+
+  async function evaluateGroupMessageDirect({
+    key = '',
+    triggerReason = 'groupMessage',
+    senderLabel = '群成员',
+    senderId = '',
+    targetText = '',
+    recentMessages = [],
+    explicitAtSelf = false,
+    quoteTargetIsSelf = false,
+  } = {}) {
+    const routerCfg = typeof getRouterConfig === 'function' ? getRouterConfig() : {};
+    const aliases = typeof getAssistantAliases === 'function' ? getAssistantAliases() : [];
+    const selfQqId = typeof getSelfQqId === 'function' ? String(getSelfQqId() || '') : '';
+    const senderIsAdmin = Boolean(senderId && (routerCfg?.ownerIdSet?.has(String(senderId)) || isCreator?.(senderId)));
+
+    const routerInput = buildRouterInput({
+      groupKey: key,
+      triggerReason,
+      selfQqId,
+      assistantAliases: aliases,
+      explicitAtSelf,
+      quoteTargetIsSelf,
+      senderIsAdmin,
+      senderLabel,
+      targetText,
+      recentMessages,
+    });
+
+    inFlightRouters += 1;
     try {
-      const st = getSocialV2State(item.key);
+      const decision = await classifyGroupMessageWithRouter({
+        routerCfg,
+        routerInput,
+        explicitAtSelf,
+        quoteTargetIsSelf,
+        fetchImpl,
+      });
+      totalRouted += 1;
+      lastDecision = {
+        at: new Date().toISOString(),
+        key,
+        trigger: triggerReason,
+        should_reply: decision.should_reply,
+        reason: decision.reason,
+        model: decision.model,
+        endpoint: decision.endpoint,
+        degraded: decision.degraded,
+        latencyMs: decision.latencyMs,
+      };
+      return decision;
+    } finally {
+      inFlightRouters = Math.max(0, inFlightRouters - 1);
+    }
+  }
+
+  async function runScheduledGroupRouter(key, st, snapshot) {
+    const {
+      finalReason, savedText, explicitAtSelf, quoteTargetIsSelf,
+      senderIsAdmin, senderLabel, judgedSeq, genAtStart,
+    } = snapshot;
+
+    if (isPaused?.() || st.pendingWakeTimer) return;
+
+    const recentSlice = (Array.isArray(st.recentMessages) ? st.recentMessages.slice(-12) : []).map((m) => {
+      const uid = String(m?.userId ?? '');
+      const adminTag = !m?.isSelf && (isCreator?.(uid) || getRouterConfig?.()?.ownerIdSet?.has(uid)) ? '[管理员]' : '';
+      const clock = m?.time ? `[${localClockText(m.time)}] ` : '';
+      return {
+        sender: m?.isSelf ? `${clock}[助手]` : `${clock}${adminTag}${String(m?.sender || uid || '群成员')}`,
+        text: String(m?.text || m?.plain || '').slice(0, 160),
+      };
+    });
+
+    const newestHuman = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
+    const targetText = String(savedText || newestHuman?.plain || newestHuman?.text || '').slice(0, 220);
+    const effectiveSender = senderLabel || String(newestHuman?.sender || newestHuman?.userId || '群成员');
+
+    st.routerInFlightCount = (Number(st.routerInFlightCount) || 0) + 1;
+    let decision;
+    try {
+      const routerCfg = typeof getRouterConfig === 'function' ? getRouterConfig() : {};
+      const aliases = typeof getAssistantAliases === 'function' ? getAssistantAliases() : [];
+      const selfQqId = typeof getSelfQqId === 'function' ? String(getSelfQqId() || '') : '';
+      const routerInput = buildRouterInput({
+        groupKey: key,
+        triggerReason: finalReason,
+        selfQqId,
+        assistantAliases: aliases,
+        explicitAtSelf,
+        quoteTargetIsSelf,
+        senderIsAdmin,
+        senderLabel: effectiveSender,
+        targetText,
+        recentMessages: recentSlice,
+      });
+
+      inFlightRouters += 1;
+      try {
+        decision = await classifyGroupMessageWithRouter({
+          routerCfg,
+          routerInput,
+          explicitAtSelf,
+          quoteTargetIsSelf,
+          fetchImpl,
+        });
+      } finally {
+        inFlightRouters = Math.max(0, inFlightRouters - 1);
+      }
+
+      totalRouted += 1;
+      lastDecision = {
+        at: new Date().toISOString(),
+        key,
+        trigger: finalReason,
+        should_reply: decision.should_reply,
+        reason: decision.reason,
+        model: decision.model,
+        endpoint: decision.endpoint,
+        degraded: decision.degraded,
+        latencyMs: decision.latencyMs,
+      };
+    } finally {
+      st.routerInFlightCount = Math.max(0, (Number(st.routerInFlightCount) || 1) - 1);
+    }
+
+    if ((keyGenerations.get(key) || 0) !== genAtStart) return;
+    if (isPaused?.()) return;
+
+    if (decision?.should_reply) {
+      const suffix = decision.degraded ? `, fallback=${decision.endpoint}` : '';
+      log(`[router] 群聊路由放行 ${key} (trigger=${finalReason}, model=${decision.model}, ${decision.latencyMs}ms${suffix}): ${decision.reason}`);
+      scheduleWakeV2(key, finalReason, { immediate: true });
+      return;
+    }
+
+    try {
       if (
         st
         && !st.pendingWakeTimer
         && !st.pendingFlashJudgeTimer
-        && !isConversationBusyV2(item.key, st)
+        && !(Number(st.routerInFlightCount) > 0)
+        && !isConversationBusyV2(key, st)
         && !(Array.isArray(st.pendingWakeReasons) && st.pendingWakeReasons.length > 0)
       ) {
-        const safeSeq = Math.min(Number(item.seq) || 0, Number(st.lastUnreadSeq) || 0);
+        const safeSeq = Math.min(Number(judgedSeq) || 0, Number(st.lastUnreadSeq) || 0);
         if (safeSeq > (st.lastReadThroughSeq || 0)) {
           acknowledgeMessagesV2(st, safeSeq);
           saveSocialV2State();
         }
       }
     } catch {}
-    log(`[reserved2] Flash 预筛拦截 ${item.key} (${decideId}, seq<=${item.seq || 0}) -> 静默标已读继续潜水`);
-    return { found: true, woke: false, key: item.key };
+    const errNote = decision?.degraded && decision?.error ? `, err=${decision.error}` : '';
+    log(`[router] 群聊路由静默忽略 ${key} (trigger=${finalReason}, model=${decision?.model || DEFAULT_ROUTER_MODEL}, ${decision?.latencyMs ?? 0}ms${errNote}): ${decision?.reason || '无需回复'}`);
   }
 
-  function enqueueAmbiguousJudgeV2(key, st, plainContent, { reason = 'probability' } = {}) {
-    if (!api.isAgyBackend) return;
-    if (st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-    pruneAmbiguousJudge();
-    const now = Date.now();
-    const baseReason = String(reason || 'probability').split(':')[0];
-    const isCallMention = baseReason === 'nameMention' || baseReason === 'keyword' || baseReason === 'ambiguousCall';
-    const lastAt = ambiguousJudgeCooldown.get(key) || 0;
-    if (!isCallMention && now - lastAt < 2500) return;
-    ambiguousJudgeCooldown.set(key, now);
-    const recentSlice = (Array.isArray(st.recentMessages) ? st.recentMessages.slice(-14) : []).map((m) => {
-      const uid = String(m.userId ?? '');
-      const ownerTag = isCreator(uid) ? `[${personaCreatorLabel()}]` : '';
-      const clock = m.time ? `[${localClockText(m.time)}] ` : '';
-      return {
-        sender: m.isSelf ? `${clock}${personaBotName()}(我)` : `${clock}${ownerTag}${String(m.sender || uid || '群友')}`,
-        text: String(m.text || m.plain || '').slice(0, 150),
-      };
-    });
-    const lastEntry = recentSlice[recentSlice.length - 1];
-    const latestPlain = String(plainContent ?? lastEntry?.text ?? '').slice(0, 180);
-    const ruleHint = isCallMention
-      ? `[名字/关键词(${reason})预筛：结合最近14条上下文判断群友是否在叫${personaBotName()}搭话、讨论它或接它话茬(yes，若[${personaCreatorLabel()}]喊必判yes)；同名梗或与${personaBotName()}无关的闲聊判no]`
-      : `[潜水概率抽样预筛：结合最近14条上下文判断是否有明确槽点/热梗/话题适合${personaBotName()}自然插一句(yes)；单字/纯表情包连刷/残句/严肃私事插不上嘴判no]`;
-    const item = {
-      id: `judge-${++ambiguousJudgeCounter}`,
-      key,
-      reason,
-      isCallMention,
-      seq: st.lastUnreadSeq || 0,
-      sender: lastEntry ? lastEntry.sender : '群友',
-      targetText: `${ruleHint} ${latestPlain}`,
-      rawTargetText: latestPlain,
-      recent: recentSlice,
-      createdAt: new Date(now).toISOString(),
-      createdAtMs: now,
-    };
-    for (const waiter of ambiguousJudgeWaiters) {
-      ambiguousJudgeWaiters.delete(waiter);
-      ambiguousJudgeInFlight.set(item.id, item);
-      waiter({ timedOut: false, item });
-      log(`[reserved2] 投递潜水回复预筛给 Flash ${key} (${item.id}, reason=${reason}, ctx=${recentSlice.length}, seq=${item.seq})`);
-      return;
-    }
-    if (ambiguousJudgeQueue.length >= 10) ambiguousJudgeQueue.shift();
-    ambiguousJudgeQueue.push(item);
-    log(`[reserved2] 潜水回复预筛入队等待 Flash ${key} (${item.id}, reason=${reason}, ctx=${recentSlice.length}, seq=${item.seq})`);
-  }
+  function scheduleFlashReplyJudgeV2(key, st, reason = 'probability', triggerText = '', meta = {}) {
+    if (!st) return;
+    const routerCfg = typeof getRouterConfig === 'function' ? getRouterConfig() : null;
+    if (!api?.isAgyBackend && !routerCfg?.hasApiKey) return;
 
-  function flashJudgePriorityV2(reason) {
-    const base = String(reason || '').split(':')[0];
-    if (base === 'nameMention') return 30;
-    if (base === 'keyword') return 25;
-    if (base === 'ambiguousCall') return 20;
-    return 10;
-  }
+    const explicitAtSelf = Boolean(meta?.explicitAtSelf);
+    const quoteTargetIsSelf = Boolean(meta?.quoteTargetIsSelf);
+    const senderId = String(meta?.senderId ?? '').trim();
+    const senderIsAdmin = Boolean(senderId && (routerCfg?.ownerIdSet?.has(senderId) || isCreator?.(senderId)));
+    const senderLabel = String(meta?.senderLabel ?? '').trim();
 
-  function scheduleFlashReplyJudgeV2(key, st, reason = 'probability', triggerText = '') {
-    if (!api?.isAgyBackend || !st) return;
-    if (st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-    if (st.pendingFlashJudgeTimer) {
-      if (flashJudgePriorityV2(reason) > flashJudgePriorityV2(st.pendingFlashJudgeReason)) {
-        st.pendingFlashJudgeReason = reason;
-        if (triggerText) st.pendingFlashJudgeTargetText = String(triggerText);
+    if (st.pendingWakeTimer) {
+      if (explicitAtSelf || quoteTargetIsSelf || flashJudgePriorityV2(reason) >= 35) {
+        scheduleWakeV2(key, reason);
       }
       return;
     }
-    st.pendingFlashJudgeReason = reason;
-    st.pendingFlashJudgeTargetText = triggerText ? String(triggerText) : '';
-    const batchMs = Math.max(400, Number(st.wakeConfig?.batchWindowMs) || 2000);
-    st.pendingFlashJudgeTimer = setTimeout(() => {
+
+    const fireTimer = () => {
       st.pendingFlashJudgeTimer = null;
-      const finalReason = st.pendingFlashJudgeReason || reason;
-      const savedText = st.pendingFlashJudgeTargetText || '';
+      const snapshot = {
+        finalReason: st.pendingFlashJudgeReason || reason,
+        savedText: st.pendingFlashJudgeTargetText || '',
+        explicitAtSelf: Boolean(st.pendingRouterExplicitAtSelf),
+        quoteTargetIsSelf: Boolean(st.pendingRouterQuoteSelf),
+        senderIsAdmin: Boolean(st.pendingRouterSenderIsAdmin),
+        senderLabel: st.pendingRouterSenderLabel || '',
+        judgedSeq: st.lastUnreadSeq || 0,
+        genAtStart: keyGenerations.get(key) || 0,
+      };
       st.pendingFlashJudgeReason = null;
       st.pendingFlashJudgeTargetText = '';
-      if (isPaused() || st.pendingWakeTimer || isConversationBusyV2(key, st)) return;
-      if (!isFlashJudgeOnlineV2()) {
-        log(`[reserved2] Flash 预筛线程未在线，降级直通唤醒 ${key} (${finalReason})`);
-        scheduleWakeV2(key, finalReason, { immediate: true });
-        return;
+      st.pendingRouterExplicitAtSelf = false;
+      st.pendingRouterQuoteSelf = false;
+      st.pendingRouterSenderIsAdmin = false;
+      st.pendingRouterSenderLabel = '';
+      void runScheduledGroupRouter(key, st, snapshot).catch((err) => {
+        log(`[router] 群聊路由未预期异常 ${key}: ${err?.message ?? err}`);
+      });
+    };
+
+    if (st.pendingFlashJudgeTimer) {
+      if (flashJudgePriorityV2(reason) >= flashJudgePriorityV2(st.pendingFlashJudgeReason)) {
+        st.pendingFlashJudgeReason = reason;
+        if (triggerText) st.pendingFlashJudgeTargetText = String(triggerText);
+        if (senderLabel) st.pendingRouterSenderLabel = senderLabel;
+      } else if (triggerText && !st.pendingFlashJudgeTargetText) {
+        st.pendingFlashJudgeTargetText = String(triggerText);
       }
-      const newestHuman = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
-      enqueueAmbiguousJudgeV2(key, st, savedText || newestHuman?.plain || newestHuman?.text || '', { reason: finalReason });
-    }, batchMs);
+      st.pendingRouterExplicitAtSelf = Boolean(st.pendingRouterExplicitAtSelf || explicitAtSelf);
+      st.pendingRouterQuoteSelf = Boolean(st.pendingRouterQuoteSelf || quoteTargetIsSelf);
+      st.pendingRouterSenderIsAdmin = Boolean(st.pendingRouterSenderIsAdmin || senderIsAdmin);
+      if (explicitAtSelf || quoteTargetIsSelf) {
+        clearTimeout(st.pendingFlashJudgeTimer);
+        st.pendingFlashJudgeTimer = setTimeout(fireTimer, 180);
+        st.pendingFlashJudgeTimer.unref?.();
+      }
+      return;
+    }
+
+    st.pendingFlashJudgeReason = reason;
+    st.pendingFlashJudgeTargetText = triggerText ? String(triggerText) : '';
+    st.pendingRouterExplicitAtSelf = explicitAtSelf;
+    st.pendingRouterQuoteSelf = quoteTargetIsSelf;
+    st.pendingRouterSenderIsAdmin = senderIsAdmin;
+    st.pendingRouterSenderLabel = senderLabel;
+
+    const configuredBatch = Math.max(200, Number(st.wakeConfig?.batchWindowMs) || 1500);
+    const batchMs = (explicitAtSelf || quoteTargetIsSelf) ? 180 : Math.min(2000, configuredBatch);
+    st.pendingFlashJudgeTimer = setTimeout(fireTimer, batchMs);
     st.pendingFlashJudgeTimer.unref?.();
-    log(`[reserved2] 计划 Flash 潜水预筛 ${key} (${reason})，${(batchMs / 1000).toFixed(1)}s 合批后判定`);
+  }
+
+  function applyAmbiguousJudgeDecision() {
+    return { found: false, deprecated: true };
   }
 
   function waitNextAmbiguousJudge({ timeoutMs = 55000, onAbortRegistrar } = {}) {
-    pruneAmbiguousJudge();
-    if (ambiguousJudgeQueue.length > 0) {
-      const item = ambiguousJudgeQueue.shift();
-      ambiguousJudgeInFlight.set(item.id, item);
-      return Promise.resolve({ timedOut: false, item });
-    }
     return new Promise((resolve) => {
       let settled = false;
-      const waiter = (outcome) => {
+      const done = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        ambiguousJudgeWaiters.delete(waiter);
-        resolve(outcome);
+        resolve({ timedOut: true, item: null, deprecated: true });
       };
-      const timer = setTimeout(() => waiter({ timedOut: true, item: null }), Math.max(1000, Math.min(timeoutMs, 120000)));
-      ambiguousJudgeWaiters.add(waiter);
-      onAbortRegistrar?.(() => waiter({ timedOut: true, item: null }));
+      const timer = setTimeout(done, Math.max(1000, Math.min(timeoutMs, 120000)));
+      onAbortRegistrar?.(done);
     });
   }
 
   return {
-    cancelFlashReplyJudgeV2, scheduleFlashReplyJudgeV2, applyAmbiguousJudgeDecision,
+    cancelFlashReplyJudgeV2,
+    scheduleFlashReplyJudgeV2,
+    evaluateGroupMessageDirect,
+    applyAmbiguousJudgeDecision,
     waitNextAmbiguousJudge,
-    notePoll() { lastJudgePollAt = Date.now(); },
+    notePoll() {},
     status() {
-      pruneAmbiguousJudge();
-      return { waitingJudges: ambiguousJudgeWaiters.size, queuedJudges: ambiguousJudgeQueue.length };
+      const cfg = typeof getRouterConfig === 'function' ? getRouterConfig() : null;
+      return {
+        waitingJudges: 0,
+        queuedJudges: 0,
+        routerMode: 'local-openai',
+        routerModel: cfg?.model || DEFAULT_ROUTER_MODEL,
+        routerConfigured: Boolean(cfg?.hasApiKey),
+        inFlightRouters,
+        totalRouted,
+        lastRouterDecision: lastDecision,
+      };
     },
   };
 }

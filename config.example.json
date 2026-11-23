@@ -23,6 +23,13 @@
     "targetUin": ""
   },
   "ownerQQ": null,
+  "ownerQQIds": [],
+  "router": {
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-6-luna",
+    "timeoutMs": 10000,
+    "maxOutputTokens": 64
+  },
   "persona": {
     "botName": "Bot",
     "nameKeywords": [],

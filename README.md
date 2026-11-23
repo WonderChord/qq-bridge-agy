@@ -4,7 +4,7 @@
 
 | 聊天后端 | 如何启用 | 如何确认已就绪 |
 | --- | --- | --- |
-| Antigravity | 将 `dsh.baseUrl` 设为 `agy://local`，安装仓库内的插件，启动值守 Worker | 控制台显示 Antigravity，待命或处理中的 Worker 至少有一个。[配置指南](docs/guides/ANTIGRAVITY.md) |
+| Antigravity / Codex | 将 `dsh.baseUrl` 设为 `agy://local`，配置 `.env` 前置路由，安装仓库内的插件拉起值守子代理（或运行 `node scripts/codex-driver.mjs start`） | 控制台显示 Antigravity，待命或处理中的 Worker 至少有一个，或 `node scripts/bridge-status.mjs` 全绿。[双宿主配置指南](docs/guides/ANTIGRAVITY.md) |
 | DeepSeek Harness | 使用示例中的本机 DSH 地址，安装 QQ preset 和 MCP | 控制台显示 DSH 已连接，QQ 会话使用所选模式的 preset。[安装指南](docs/guides/DSH_SETUP.md) |
 
 ## 从源码开始
@@ -17,6 +17,7 @@ cd qq-bridge-agy
 npm ci
 npm test
 Copy-Item config.example.json config.json
+Copy-Item .env.example .env
 ```
 
 在 `config.json` 填写 OneBot 的 WebSocket 与 HTTP 地址、令牌、`ownerQQ` 和需要响应的 `allow.private` 或 `allow.groups`。完成对应后端的设置后运行 `npm start`。控制台默认位于 `http://127.0.0.1:3100`，首次登录使用 `state/console-token` 里的令牌，手动配置了 `consoleToken` 时使用配置值。

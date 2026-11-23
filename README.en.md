@@ -21,12 +21,12 @@ QQ messages ──► SnowLuma / NapCat (OneBot v11 WS) ──► qq-bridge ─�
 
 In addition to DeepSeek Harness (DSH), `qq-bridge` now natively supports **Google Antigravity (AGY)** via zero-polling long-poll wakeups (`dsh.baseUrl = "agy://local"`) and **Headless NapCat** daemon management under the same MIT license:
 
-- **Ultra-Low-Token 3-Subagent Architecture (`agy-plugin/`)**:
-  1. **`qq-chat-worker` (`w1`)**: Single-worker KV-cache-warmed chat loop with compact wake headers and batched messages. Uses `scripts/agy-reply-and-wait.mjs` to send text/batch replies, stickers (`--sticker`), native QQ voice bubbles (`--tts`), or Codex drawings (`--codex-draw`) and mark messages read in **one command**, rotating cleanly every **25 turns**.
-  2. **`qq-flash-judge` (`flash`)**: Zero-token pre-filter strips single-char/image-only noise before passing ambiguous nickname hits (`persona.ambiguousKeywords`) and `0.12` diving samples (with 14-message context) to Flash for instant `yes/no` gating; rotates every **30 turns**.
-  3. **`qq-memory-archivist` (`flash`)**: Asynchronous compartmented long-term memory archiver configured via `persona.memoryCompartments` (e.g. every 150 group messages / 40 private messages), stored in the configured directories.
-- **Zero-Deployment Dual-Provider TTS (`/api/socialV2/send-tts` & `--tts`)**:
-  - Supports **ElevenLabs** (`ELEVENLABS_API_KEY` env var, `eleven_v3`) as primary and **Google TTS** (keyless GTX endpoint) as automatic fallback, encoding native QQ SILK voice bubbles via `ffmpeg` + OneBot `record`.
+- **Local Pre-Routing + Dual-Host Architecture (`agy-plugin/` & `scripts/codex-driver.mjs`)**:
+  - **Local Pre-Router (`src/message-router.js`)**: Whitelisted owner private chats (`OWNER_QQ_IDS`) bypass external APIs completely with queue-head priority; group candidates are classified inside `qq-bridge` via `ROUTER_MODEL` (`gpt-6-luna`, `reasoning: { effort: "none" }`, zero persona/memory leakage) with 10s timeout and `@self` / quote-self graceful fallback.
+  1. **`qq-chat-worker` (`w1`)**: Single-worker KV-cache-warmed chat loop handling confirmed wakes with `>8KB` spill-file truncation protection, 3-layer PowerShell `--batch` quote recovery, and outbound refusal interception. Rotates every **30 turns** (**20** in immersive roleplay; or detached background daemon via `scripts/codex-driver.mjs` with 180s stream-stall + 480s hard-timeout self-healing).
+  2. **`qq-memory-archivist`**: Local asynchronous compartmented long-term memory archiver (`summary.md`, `people.md`, `event_book.md`, `diary/YYYY-MM-DD.md`) with UTF-8 integrity verification and **4-batch** rotation.
+- **High-Expressiveness Async TTS (`/api/socialV2/send-tts` & `--tts`)**:
+  - Non-blocking `async: true` voice synthesis queue supporting local **Fish Audio Drama 3** (`fish_local`), cloud **Fish Audio Drama 3** (48kHz multi-emotion msgpack references + `[]` / `<whisper>` director tags), **ElevenLabs** (`eleven_v3`), and **Google TTS** fallback, encoded as native QQ voice bubbles via `ffmpeg`.
 - **Headless NapCat Kernel Probe & Self-Healing (`scripts/ensure-daemons.ps1`)**:
   - Detects silent NTQQ MSF kernel hangs via `get_stranger_info(no_cache: true)` and restarts headless NapCat hidden (`ShowWindow=0`) with ticket-only `SetQuickLogin` (`scripts/napcat-auto-relogin.mjs`).
 

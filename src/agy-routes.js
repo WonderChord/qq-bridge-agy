@@ -115,6 +115,27 @@ export async function handleAgyRequest({
     sendJson({ ok: true, completed });
     return true;
   }
+  if (req.method === 'POST' && pathname === '/api/agy/requeue') {
+    const body = await readBody();
+    const workerId = body?.workerId ? String(body.workerId).trim() : '';
+    const turn = body?.turn ? String(body.turn).trim() : '';
+    if (workerId) {
+      memory.clearWorkerHotReloadSigsV2(workerId);
+    }
+    const result = api.requeueTurn({ turn, workerId });
+    log(`[reserved2] 触发拒答保护回退重排 worker=${workerId || '-'} turn=${turn || '-'} -> requeued=${result.requeued}`);
+    sendJson({ ok: true, ...result });
+    return true;
+  }
+  if (req.method === 'POST' && pathname === '/api/agy/force-rotate') {
+    const body = await readBody();
+    const workerId = String(body?.workerId || 'w1').trim() || 'w1';
+    memory.clearWorkerHotReloadSigsV2(workerId);
+    const result = api.forceRotateWorker(workerId);
+    log(`[reserved2] 强制换新线程 ${workerId} (wokeWaiter=${result.wokeWaiter})`);
+    sendJson({ ok: true, ...result });
+    return true;
+  }
   if (req.method === 'GET' && pathname === '/api/agy/wait') {
     const workerId = (url.searchParams.get('workerId') || 'primary').trim();
     const defaultPriority = workerId === 'primary' ? 10 : 5;

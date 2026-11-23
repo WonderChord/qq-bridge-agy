@@ -8,6 +8,7 @@
 import { createTurnClaims } from './agy-turn-claims.js';
 import { createMemoryCompartments } from './memory-compartment.js';
 import { createArchiveChannel, createFlashJudge } from './agy-coordinator.js';
+import { resolveRouterConfig, hasExplicitAtSelf } from './message-router.js';
 import { handleAgyRequest } from './agy-routes.js';
 import { readConsolePage, consoleLoginPage } from './webui-page.js';
 import fs from 'node:fs';
@@ -70,6 +71,7 @@ const ROOT = path.resolve(__dirname, '..');
 const STATE_DIR = path.join(ROOT, 'state');
 const DRAWN_DIR = path.join(STATE_DIR, 'drawn');
 const STICKER_DIR = path.join(ROOT, 'stickers');
+const STICKER_DEPRECATED_DIR = path.join(ROOT, 'stickers_deprecated');
 const ASSETS_DIR = path.join(ROOT, 'assets');
 const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
@@ -693,6 +695,8 @@ function loadConfig() {
     agentPreset: file.agentPreset ?? 'qq-chat',
     workspaceTitle: file.workspaceTitle ?? 'QQ 聊天',
     ownerQQ: normalizeOwnerQQ(file.ownerQQ),
+    ownerQQIds: normalizeIdList(file.ownerQQIds ?? []),
+    router: (file.router && typeof file.router === 'object' && !Array.isArray(file.router)) ? file.router : {},
     allow: {
       private: normalizeIdList(file.allow?.private ?? file.allow?.privates ?? []),
       groups: normalizeIdList(file.allow?.groups ?? file.allow?.group ?? [])
@@ -1368,6 +1372,10 @@ function allowed(kind, id, cfg) {
   const s = String(id);
   const denyList = cfg.deny[kind] ?? cfg.deny[kind + 's'] ?? [];
   if (denyList.map(String).includes(s)) return false;
+  if (kind === 'private') {
+    const routerCfg = resolveRouterConfig({ rootDir: ROOT, env: process.env, cfg });
+    if (routerCfg.explicitOwnerIds.includes(s)) return true;
+  }
   const allowList = cfg.allow[kind] ?? cfg.allow[kind + 's'] ?? [];
   if (allowList.length > 0) return allowList.map(String).includes(s);
   return cfg.allowAllWhenEmpty;
@@ -1705,6 +1713,7 @@ async function main() {
   // 语音发送时间戳（scopeKey → number[]）：与文本发送分开计数，语音额度独立。
   const voiceSendTimes = new Map();
   const voiceSendsPending = new Map();
+  let ttsAsyncChain = Promise.resolve();
 
   /**
    * 出站语音的内容审计：与文本一致，凡是「疑似敏感信息 / 含会话令牌」的**文件名**
@@ -3633,10 +3642,27 @@ async function main() {
   const nameMentionHit = (text) => !!keywordRegExp(personaCfg().nameKeywords)?.test(String(text ?? ''));
   const creatorNickHit = (text) => !!keywordRegExp(personaCfg().creatorNickKeywords)?.test(String(text ?? ''));
   const AMBIGUOUS_CALL_RE = { test: (text) => !!keywordRegExp(personaCfg().ambiguousKeywords)?.test(String(text ?? '')) };
+  const getRouterConfig = () => resolveRouterConfig({ rootDir: ROOT, env: process.env, cfg });
+  const getSelfQqId = () => String(selfUserId || cfg.napcat?.account || cfg.snowluma?.targetUin || '').trim();
+  const getAssistantAliases = () => {
+    const p = personaCfg();
+    const rawBotName = p.botName && p.botName !== 'Bot' ? [String(p.botName)] : [];
+    return [...new Set([
+      ...(selfDisplayName ? [selfDisplayName] : []),
+      ...rawBotName,
+      ...(Array.isArray(p.nameKeywords) ? p.nameKeywords : []),
+      ...(Array.isArray(p.ambiguousKeywords) ? p.ambiguousKeywords : []),
+      ...(Array.isArray(cfg.socialV2?.wake?.recommendedKeywords) ? cfg.socialV2.wake.recommendedKeywords : []),
+    ].map((s) => String(s ?? '').trim()).filter(Boolean))];
+  };
   const CREATOR_UIDS = {
     has: (uid) => {
+      const s = String(uid ?? '').trim();
+      if (!s) return false;
+      const rCfg = getRouterConfig();
+      if (rCfg.explicitOwnerIds.includes(s)) return true;
       const list = normalizeIdList(personaCfg().creatorUids);
-      return list.length ? list.includes(String(uid)) : !!cfg.ownerQQ && String(cfg.ownerQQ) === String(uid);
+      return list.length ? list.includes(s) : !!cfg.ownerQQ && String(cfg.ownerQQ) === s;
     }
   };
   let codexDrawInFlight = 0;
@@ -3648,9 +3674,10 @@ async function main() {
   const flashJudge = createFlashJudge({
     api, log, scheduleWakeV2, getSocialV2State, isConversationBusyV2, acknowledgeMessagesV2,
     saveSocialV2State, isPaused: () => socialV2.paused, isCreator: (uid) => CREATOR_UIDS.has(uid),
-    personaCreatorLabel, localClockText, personaBotName,
+    localClockText, getRouterConfig, getAssistantAliases, getSelfQqId,
+    fetchImpl: (...args) => fetch(...args),
   });
-  const { cancelFlashReplyJudgeV2, scheduleFlashReplyJudgeV2 } = flashJudge;
+  const { cancelFlashReplyJudgeV2, scheduleFlashReplyJudgeV2, evaluateGroupMessageDirect } = flashJudge;
   const memory = createMemoryCompartments({
     root: ROOT, cfg, api, archive, localClockText, personaBotName, getSelfUserId: () => selfUserId,
     getGroupState: (key) => socialV2.conversations.get(key), readRoleState, roleFilePath,
@@ -3923,6 +3950,13 @@ async function main() {
             sendJson({ ok: false, error: '该接口仅控制台可用' }, 403);
             return;
           }
+          const activeTok = String(req.headers['x-agent-token']).trim();
+          for (const [convKey, convSt] of socialV2.conversations.entries()) {
+            if (convSt?.agentToken === activeTok && state.sessions[convKey]) {
+              api.touchSessionTurns?.(state.sessions[convKey]);
+              break;
+            }
+          }
         }
         // 只读降级：黑话库/表情库在启动时加载失败时，写接口必须**明确失败**。
         // 旧行为是 save 函数里只打一行日志就 return，而接口照样回 {ok:true}：
@@ -3939,7 +3973,8 @@ async function main() {
               || url.pathname === '/api/stickers/remark'
               || url.pathname === '/api/socialV2/sticker-note'
               || url.pathname === '/api/socialV2/sticker-remark'
-              || url.pathname === '/api/socialV2/collect-sticker')) ? '表情库'
+              || url.pathname === '/api/socialV2/collect-sticker'
+              || url.pathname === '/api/socialV2/deprecate-sticker')) ? '表情库'
               : '';
           if (readonlyStore) {
             sendJson({ ok: false, error: `${readonlyStore}处于只读降级状态（启动时加载失败，未覆盖原文件），本次修改不会落盘；请修复 state/ 下的对应文件后重启桥接` }, 503);
@@ -5761,6 +5796,11 @@ async function main() {
               sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
               return;
             }
+            if (/(?:抱歉|对不起|很抱歉)[，,。！\s]*(?:我(?:无法|不能|不便|不会|目前无法)|作为(?:一个|一名)?|这(?:超出了|违反了))|我(?:无法|不能)(?:生成|提供|继续|参与|回应|撰写|编写|协助)[^。！\n]{0,36}(?:露骨|色情|性描写|成人|情色|亲密|恋爱|不适当|违规|敏感)|我是(?:一个|一名)?(?:没有实体的)?人工智能|没有实体[，,。！\s]*(?:也)?不(?:能|会|参与)|不参与(?:恋爱|亲密|色情|成人)(?:或[^。！\n]{0,12})?(?:情景|角色)?扮演|作为(?:一个|一名)?\s*(?:AI|人工智能)(?:助手|模型|语言模型)?[，,]|I\s+(?:cannot|can't|am\s+unable\s+to)\s+(?:fulfill|generate|create|engage\s+in|participate\s+in|comply)|I(?:'m|\s+am)\s+sorry,?\s+(?:but\s+)?I\s+(?:cannot|can't)/i.test(msg)) {
+              log(`[reserved2] 服务端硬拦截系统拒答套话外发 ${key}: "${msg.slice(0, 48)}"`);
+              sendJson({ ok: false, refusalBlocked: true, error: '检测到跳出角色的系统拒答套话，已拦截发送（未写入消息历史）' }, 422);
+              return;
+            }
           }
           const st = getSocialV2State(key);
           const now = Date.now();
@@ -5907,6 +5947,11 @@ async function main() {
             }
             if (SENSITIVE_RE.test(msg)) {
               sendJson({ ok: false, error: '消息含敏感信息，已阻止发送' }, 403);
+              return;
+            }
+            if (/(?:抱歉|对不起|很抱歉)[，,。！\s]*(?:我(?:无法|不能|不便|不会|目前无法)|作为(?:一个|一名)?|这(?:超出了|违反了))|我(?:无法|不能)(?:生成|提供|继续|参与|回应|撰写|编写|协助)[^。！\n]{0,36}(?:露骨|色情|性描写|成人|情色|亲密|恋爱|不适当|违规|敏感)|我是(?:一个|一名)?(?:没有实体的)?人工智能|没有实体[，,。！\s]*(?:也)?不(?:能|会|参与)|不参与(?:恋爱|亲密|色情|成人)(?:或[^。！\n]{0,12})?(?:情景|角色)?扮演|作为(?:一个|一名)?\s*(?:AI|人工智能)(?:助手|模型|语言模型)?[，,]|I\s+(?:cannot|can't|am\s+unable\s+to)\s+(?:fulfill|generate|create|engage\s+in|participate\s+in|comply)|I(?:'m|\s+am)\s+sorry,?\s+(?:but\s+)?I\s+(?:cannot|can't)/i.test(msg)) {
+              log(`[reserved2] 服务端硬拦截系统拒答套话外发 ${key}: "${msg.slice(0, 48)}"`);
+              sendJson({ ok: false, refusalBlocked: true, error: '检测到跳出角色的系统拒答套话，已拦截发送（未写入消息历史）' }, 422);
               return;
             }
           }
@@ -6383,10 +6428,68 @@ async function main() {
               sendJson({ ok: false, error: '台词包含敏感信息，已拦截合成' }, 403);
               return;
             }
+            if (/申し(?:訳ございません|わけありません)が[、,\s]*(?:露骨|性的|アダルト|そのような)|(?:抱歉|对不起)[，,。！\s]*我(?:无法|不能)/i.test(text)) {
+              log(`[reserved2] 服务端硬拦截拒答语音合成 ${key}: "${text.slice(0, 48)}"`);
+              sendJson({ ok: false, refusalBlocked: true, error: '检测到拒答套话，已拦截语音合成' }, 422);
+              return;
+            }
             const maxSegChars = Number(cfg.socialV2?.tts?.fish?.maxSegmentChars) || 150;
             const segments = body.split === false ? [text] : splitDrama3TextForTts(text, maxSegChars);
             const ttsDir = path.join(STATE_DIR, 'tts');
             fs.mkdirSync(ttsDir, { recursive: true });
+            const isLocalGpuTts = String(body.provider || cfg.socialV2?.tts?.provider || '') === 'fish_local';
+            if (body.async === true) {
+              try {
+                voiceBudgetCheck(key, voice);
+              } catch (err) {
+                sendJson({ ok: false, error: err?.message ?? String(err) }, err?.statusCode || 429);
+                return;
+              }
+              const asyncActionSig = 'voice:[语音] ' + text.slice(0, 80);
+              const dupErr = checkTurnActionV2(key, body.turn, asyncActionSig);
+              if (dupErr) {
+                sendJson({ ok: false, error: dupErr }, 409);
+                return;
+              }
+              claims.recordTurnAction(key, body.turn, asyncActionSig);
+              const stNow = getSocialV2State(key);
+              if (stNow) stNow.lastActionAt = Date.now();
+              sendJson({ ok: true, queued: true, key, segments: segments.length });
+              const bodySnap = { ...body, turn: '' };
+              ttsAsyncChain = ttsAsyncChain.catch(() => {}).then(async () => {
+                const bgFiles = [];
+                try {
+                  for (let i = 0; i < segments.length; i += 1) {
+                    const segText = segments[i];
+                    const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
+                    const filePath = path.join(ttsDir, fileName);
+                    bgFiles.push(filePath);
+                    const segLabel = segments.length > 1
+                      ? `[语音 ${i + 1}/${segments.length}] ${segText.slice(0, 80)}`
+                      : '[语音] ' + text.slice(0, 80);
+                    await sendVoiceForV2(key, fileName, {
+                      label: segLabel,
+                      verify: bodySnap.verify,
+                      guard,
+                      turn: '',
+                      prepare: async () => {
+                        const result = await synthesizeSpeech(segText, cfg.socialV2.tts, bodySnap, voice.maxBytes);
+                        fs.mkdirSync(ttsDir, { recursive: true });
+                        fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
+                        return filePath;
+                      },
+                    });
+                  }
+                } catch (err) {
+                  log(`[voice] 异步 TTS 合成/投递未完成 (${key}): ${err?.message ?? err}`);
+                } finally {
+                  for (const fp of bgFiles) {
+                    if (fs.existsSync(fp)) setTimeout(() => { try { fs.unlinkSync(fp); } catch {} }, 15000).unref();
+                  }
+                }
+              });
+              return;
+            }
             const tempFiles = [];
             const sentResults = [];
             let usedProvider = '';
@@ -6406,9 +6509,8 @@ async function main() {
                   guard,
                   turn: body.turn,
                   prepare: async () => {
-                    // 仅在通过 sendVoiceForV2 的并发/额度/暂停校验后才启动合成，并为下一段流水线预热
                     const curPromise = nextSynthPromise || synthesizeSpeech(segText, cfg.socialV2.tts, body, voice.maxBytes);
-                    if (i + 1 < segments.length) {
+                    if (!isLocalGpuTts && i + 1 < segments.length) {
                       nextSynthPromise = synthesizeSpeech(segments[i + 1], cfg.socialV2.tts, body, voice.maxBytes);
                       nextSynthPromise.catch(() => {});
                     } else {
@@ -6907,6 +7009,106 @@ async function main() {
               }
             }
           })();
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/deprecate-sticker') {
+          if (!stickerEnabled()) { sendJson({ ok: false, error: '表情包体系已关闭' }, 403); return; }
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const rawRef = String(body.stickerId ?? body.ref ?? '').trim();
+          const replyToMessageId = body.replyToMessageId != null ? String(body.replyToMessageId).trim() : '';
+          if (!rawRef) { sendJson({ ok: false, error: 'stickerId 不能为空' }, 400); return; }
+          const isAgent = Boolean(req.headers['x-agent-token'] || req.headers['x-agent-call']);
+          if (isAgent) {
+            if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+            if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+            if (!v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+            const km = /^(group|private):(\d+)$/.exec(key);
+            if (!km) { sendJson({ ok: false, error: 'key 格式无效' }, 400); return; }
+            const [, kind, convId] = km;
+            const st = getSocialV2State(key);
+            const now = Date.now();
+            let creatorAuthorized = false;
+            if (kind === 'private') {
+              creatorAuthorized = CREATOR_UIDS.has(String(convId));
+            } else {
+              if (replyToMessageId) {
+                const resolved = await resolveReplyTargetV2(st, kind, convId, replyToMessageId);
+                if (resolved?.info?.userId && CREATOR_UIDS.has(String(resolved.info.userId))) {
+                  creatorAuthorized = true;
+                }
+              }
+              if (!creatorAuthorized) {
+                creatorAuthorized = (st.recentMessages || []).some(
+                  (m) => m && !m.isSelf && CREATOR_UIDS.has(String(m.userId || '')) && (now - Number(m.time || 0) <= 180000)
+                );
+              }
+            }
+            if (!creatorAuthorized) {
+              log(`[sticker] 拦截非 Creator 表情废弃请求 ${key} (${rawRef})`);
+              sendJson({ ok: false, error: '仅管理员/Creator 可移除或废弃表情包' }, 403);
+              return;
+            }
+          }
+
+          let targets = [];
+          if (/^keyword:/i.test(rawRef)) {
+            const kw = rawRef.slice(8).trim().toLowerCase();
+            if (kw.length < 2) { sendJson({ ok: false, error: '关键词至少 2 个字符' }, 400); return; }
+            targets = stickerEntries.filter((e) => {
+              const hay = [e?.localNote, e?.desc, ...(Array.isArray(e?.tags) ? e.tags : [])].join(' ').toLowerCase();
+              return hay.includes(kw);
+            });
+          } else {
+            const single = findSticker(stickerEntries, rawRef);
+            if (single) targets = [single];
+          }
+          if (targets.length === 0) {
+            sendJson({ ok: false, error: `未找到匹配的表情包：${rawRef}` }, 404);
+            return;
+          }
+
+          fs.mkdirSync(STICKER_DEPRECATED_DIR, { recursive: true });
+          const targetIds = new Set(targets.map((t) => t.id));
+          const movedFiles = [];
+          let md5Added = false;
+          for (const item of targets) {
+            const md5 = String(item?.md5 || '').trim().toUpperCase();
+            if (/^[A-F0-9]{32}$/.test(md5) && !supersededMd5s.has(md5)) {
+              supersededMd5s.add(md5);
+              md5Added = true;
+            }
+            const candidates = [
+              item?.localPath ? path.resolve(String(item.localPath)) : '',
+              item?.localName ? path.resolve(STICKER_DIR, path.basename(String(item.localName))) : '',
+            ].filter(Boolean);
+            for (const srcPath of new Set(candidates)) {
+              try {
+                const rel = path.relative(STICKER_DIR, srcPath);
+                if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+                if (fs.existsSync(srcPath) && fs.statSync(srcPath).isFile()) {
+                  const destPath = path.join(STICKER_DEPRECATED_DIR, path.basename(srcPath));
+                  fs.renameSync(srcPath, destPath);
+                  movedFiles.push(path.basename(srcPath));
+                }
+              } catch (err) {
+                log(`[sticker] 移动废弃表情文件失败 (${srcPath}): ${err?.message ?? err}`);
+              }
+            }
+          }
+          if (md5Added) {
+            atomicWriteJson(supersededFile, [...supersededMd5s]);
+          }
+          stickerEntries = stickerEntries.filter((e) => !targetIds.has(e.id));
+          saveStickerStoreSafe();
+          log(`[sticker] 已将 ${targets.length} 张表情移入 stickers_deprecated（文件: ${movedFiles.join(', ') || '仅云端屏蔽'}）`);
+          sendJson({
+            ok: true,
+            deprecatedCount: targets.length,
+            movedFiles,
+            deprecatedNotes: targets.map((t) => ({ id: String(t.md5 || t.id).slice(0, 8), note: t.localNote || t.desc || '' })),
+            remaining: stickerEntries.length,
+          });
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/socialV2/collect-sticker') {
@@ -10802,6 +11004,19 @@ async function main() {
   }
   async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
     pruneReplyInfoCache();
+    const refStr = String(messageId ?? '').trim();
+    const convSt = socialV2.conversations.get(convKey(kind, convId));
+    if (convSt && Array.isArray(convSt.recentMessages)) {
+      const localHit = [...convSt.recentMessages].reverse().find((m) => m?.messageId != null && String(m.messageId) === refStr);
+      if (localHit) {
+        const effSelf = selfId ?? getSelfQqId();
+        return {
+          sender: String(localHit.sender || (localHit.isSelf ? (selfDisplayName || '助手') : '未知')),
+          text: String(localHit.text || localHit.plain || '').slice(0, 200),
+          userId: localHit.userId != null ? String(localHit.userId) : (localHit.isSelf && effSelf ? String(effSelf) : null),
+        };
+      }
+    }
     const cacheKey = `${kind}:${String(convId)}:${String(messageId)}`;
     const hit = replyInfoCache.get(cacheKey);
     if (hit && Date.now() - hit.ts < (hit.info ? REPLY_INFO_TTL_MS : REPLY_NEGATIVE_TTL_MS)) return hit.info;
@@ -10891,12 +11106,22 @@ async function main() {
   }
 
   // 判断当前消息是否“引用/回复了机器人自己”：若是，则桥接层也把它当作直接对 AI 说。
+  // 优先核对当前会话内存 recentMessages（即使 OneBot get_msg 缓存淘汰也能秒命中刚发的表情/文字）。
   async function isQuoteTargetSelf(message, kind, id, selfId) {
-    if (!Array.isArray(message) || selfId == null) return false;
+    if (!Array.isArray(message)) return false;
+    const effectiveSelfId = selfId ?? getSelfQqId();
+    const convSt = socialV2.conversations.get(convKey(kind, id));
+    const localPool = Array.isArray(convSt?.recentMessages) ? convSt.recentMessages : [];
     for (const seg of message) {
       if (seg?.type === 'reply' && seg.data?.id != null) {
-        const info = await resolveReplyInfo(kind, id, String(seg.data.id), selfId);
-        if (info?.userId && String(info.userId) === String(selfId)) return true;
+        const refId = String(seg.data.id).trim();
+        if (localPool.some((m) => m?.isSelf && m.messageId != null && String(m.messageId) === refId)) {
+          return true;
+        }
+        if (effectiveSelfId != null && String(effectiveSelfId) !== '') {
+          const info = await resolveReplyInfo(kind, id, refId, effectiveSelfId);
+          if (info?.userId && String(info.userId) === String(effectiveSelfId)) return true;
+        }
       }
     }
     return false;
@@ -11533,7 +11758,7 @@ async function main() {
         && /[画图绘改像表情]/.test(String(m.plain || m.text || '')));
       const hasVoiceReq = Array.isArray(st.unread) && st.unread.some((m) => /(?:语音|说话|开口|声音|叫一[声下]|听.*声|发条语音|念一[下遍]|tts)/i.test(String(m?.plain || m?.text || '')));
       const drawHint = hasCreatorDrawReq
-        ? '\n【外包画图提示】Creator 若让画图/改图，同命令直接加 --codex-draw "{\"prompt\":\"详细画面描述\",\"selfRef\":true}"（自动挂载 persona.selfRefs 与 appearanceAnchor；勿用内置 generate_image）。'
+        ? '\n【外包画图提示】Creator 若让画图/改图，同命令直接加 --codex-draw "{\\"prompt\\":\\"详细画面描述\\",\\"selfRef\\":true}"（自动挂载 persona.selfRefs 与 appearanceAnchor；严禁用内置 generate_image）。'
         : '';
       const voiceHint = hasVoiceReq && voiceCfg().enabled && v2ToolEnabled('sendVoice') && ttsEnabled()
         ? '\n【语音气泡提示】对方想听你发语音/说话，可在 agy-reply-and-wait.mjs 同命令加 --tts "[色っぽく艶のある甘い吐息交じりの声で、小悪魔っぽくからかうように] 日语タメ口台词（单条字数不做硬性限制，15秒内完整句群放在同一个 --tts 里一口气说完，严禁在逗号处拆句；耳语用 <whisper>...</whisper>、放软用 <soft>...</soft>）"，且【必须同时带上对应的中文文本消息】（严禁只发 --tts 不发中文文字）！'
@@ -12094,6 +12319,7 @@ async function main() {
   function clearSocialV2Timers(key) {
     const st = socialV2.conversations.get(key);
     if (!st) return;
+    cancelFlashReplyJudgeV2(key, st);
     if (st.pendingWakeTimer) {
       clearTimeout(st.pendingWakeTimer);
       st.pendingWakeTimer = null;
@@ -12182,7 +12408,10 @@ async function main() {
     const quoteTargetIsSelf = await isQuoteTargetSelf(event.message ?? [], kind, id, event.self_id);
     if (!isSessionAllowedInCurrentMode(key)) return;
     if (!plainContent && !quoteTargetIsSelf) return;
-    const isOwner = String(event.user_id) === String(cfg.ownerQQ ?? '');
+    const routerCfg = getRouterConfig();
+    const senderQqId = String(event?.user_id ?? event?.sender?.user_id ?? id ?? '').trim();
+    const messageType = String(event?.message_type || kind || '').toLowerCase();
+    const isOwner = Boolean(senderQqId && (senderQqId === String(cfg.ownerQQ ?? '') || routerCfg.explicitOwnerIds.includes(senderQqId)));
     const roleState = readRoleState();
 
     // 若该会话有挂起的提问/审批，先当作回答处理（用当前消息自己的文字，不含引用原文）。
@@ -12299,7 +12528,37 @@ async function main() {
       // 其余 / 开头内容照常发给 DSH（DSH 的斜杠命令原样执行，如 /model）
     }
 
-    // 二代仿真模式（reserved2）：唤醒调度
+    // ── 前置消息分流：私聊白名单零外部请求直通 + 群聊 gpt-6-luna 轻量路由鉴定 ──────
+    if (messageType === 'private' || kind === 'private') {
+      if (routerCfg.hasExplicitOwnerIds && !routerCfg.ownerIdSet.has(senderQqId)) {
+        log(`[router] 私聊消息拦截 ${key}：发送者 ${senderQqId || '?'} 不在 OWNER_QQ_IDS 白名单内`);
+        return;
+      }
+      // 白名单私聊：完全跳过任何外部路由 API 请求，直接转发给本地主会话
+      if (currentMode === 'reserved2') {
+        appendSocialV2Message(key, '私聊', textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
+        if (socialV2.paused) {
+          appendActivity(`${key} [reserved2] AI 已暂停，消息仅入库不唤醒：${textContent.slice(0, 80)}`);
+          return;
+        }
+        const st = getSocialV2State(key);
+        if (!st.bootstrapSent) {
+          st.bootstrapSent = true;
+          saveSocialV2State();
+          scheduleWakeV2(key, api?.isAgyBackend ? 'private' : 'bootstrap');
+        } else {
+          scheduleWakeV2(key, 'private');
+        }
+        appendActivity(`${key} [reserved2] 白名单私聊直通已入未读：${textContent.slice(0, 80)}`);
+        return;
+      }
+    }
+
+    const explicitAtSelf = (messageType === 'group' || kind === 'group')
+      ? hasExplicitAtSelf(event, [getSelfQqId()])
+      : false;
+
+    // 二代仿真模式（reserved2）：群聊唤醒调度
     if (currentMode === 'reserved2') {
       const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
       appendSocialV2Message(key, sender, textContent, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []));
@@ -12310,36 +12569,70 @@ async function main() {
         return;
       }
       const st = getSocialV2State(key);
-      if (!st.bootstrapSent) {
+      if (!st.bootstrapSent && !api?.isAgyBackend && !routerCfg.hasApiKey) {
         st.bootstrapSent = true;
         saveSocialV2State();
         scheduleWakeV2(key, 'bootstrap');
       } else {
-        const reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+        if (!st.bootstrapSent) {
+          st.bootstrapSent = true;
+          saveSocialV2State();
+        }
+        let reason = evaluateWakeTriggerV2(key, st, event, kind, textContent, plainContent, quoteTargetIsSelf);
+        if (!reason && explicitAtSelf) reason = 'atMention';
+        if (!reason && st.wakeConfig?.triggers?.nameMention !== false && nameMentionHit(plainContent)) reason = 'nameMention';
+        if (!reason && AMBIGUOUS_CALL_RE.test(String(plainContent ?? ''))) reason = 'ambiguousCall';
+
         if (reason) {
-          const baseReason = String(reason).split(':')[0];
-          if (kind === 'group' && baseReason !== 'atMention' && baseReason !== 'anyMessage') {
-            scheduleFlashReplyJudgeV2(key, st, reason, plainContent);
+          if (api?.isAgyBackend || routerCfg.hasApiKey) {
+            scheduleFlashReplyJudgeV2(key, st, reason, textContent || plainContent, {
+              explicitAtSelf,
+              quoteTargetIsSelf,
+              senderId: senderQqId,
+              senderLabel: sender,
+            });
           } else {
             scheduleWakeV2(key, reason);
           }
-        } else if (kind === 'group') {
-          if (AMBIGUOUS_CALL_RE.test(String(plainContent ?? ''))) {
-            scheduleFlashReplyJudgeV2(key, st, 'ambiguousCall', plainContent);
-          } else if (
-            !st.pendingWakeTimer
-            && !st.pendingFlashJudgeTimer
-            && !isConversationBusyV2(key, st)
-            && !(Array.isArray(st.pendingWakeReasons) && st.pendingWakeReasons.length > 0)
-            && Array.isArray(st.unread)
-            && st.unread.length > 4
-          ) {
-            acknowledgeMessagesV2(st, Math.max(0, (st.lastUnreadSeq || 0) - 4));
-          }
+        } else if (
+          !st.pendingWakeTimer
+          && !st.pendingFlashJudgeTimer
+          && !(Number(st.routerInFlightCount) > 0)
+          && !isConversationBusyV2(key, st)
+          && !(Array.isArray(st.pendingWakeReasons) && st.pendingWakeReasons.length > 0)
+          && Array.isArray(st.unread)
+          && st.unread.length > 4
+        ) {
+          acknowledgeMessagesV2(st, Math.max(0, (st.lastUnreadSeq || 0) - 4));
         }
       }
       appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);
       return;
+    }
+
+    // 非二代模式（chat / reserved）下的群聊前置门卫路由拦截
+    if ((messageType === 'group' || kind === 'group') && (api?.isAgyBackend || routerCfg.hasApiKey)) {
+      const senderLabel = event.sender?.card || event.sender?.nickname || String(event.user_id);
+      const recentHist = (social.recentMessages.get(key) ?? []).slice(-12).map((m) => ({
+        sender: m.sender || '群成员',
+        text: m.text || m.plain || '',
+      }));
+      const decision = await evaluateGroupMessageDirect({
+        key,
+        triggerReason: explicitAtSelf ? 'atMention' : 'groupMessage',
+        senderLabel,
+        senderId: senderQqId,
+        targetText: plainContent || textContent,
+        recentMessages: recentHist,
+        explicitAtSelf,
+        quoteTargetIsSelf,
+      });
+      if (!decision.should_reply) {
+        const errNote = decision.degraded && decision.error ? `, err=${decision.error}` : '';
+        log(`[router] 群聊路由静默忽略 ${key} (mode=${currentMode}, model=${decision.model}, ${decision.latencyMs}ms${errNote}): ${decision.reason}`);
+        return;
+      }
+      log(`[router] 群聊路由放行 ${key} (mode=${currentMode}, model=${decision.model}, ${decision.latencyMs}ms): ${decision.reason}`);
     }
 
     // 黑话学习素材：只从群聊普通消息进入滚动窗口（命令/角色控制语不学；只学当前消息自己的文字，不学引用原文）
@@ -12609,8 +12902,13 @@ async function main() {
         sender = await resolveGroupMemberName(Number(id), senderId) || senderId;
       } catch {}
     }
+    const routerCfg = getRouterConfig();
+    if (kind === 'private' && routerCfg.hasExplicitOwnerIds && !routerCfg.ownerIdSet.has(senderId)) {
+      log(`[router] 私聊拍一拍拦截 ${key}：发送者 ${senderId || '?'} 不在 OWNER_QQ_IDS 白名单内`);
+      return;
+    }
     const targetIsSelf = !!targetId && selfId != null && String(targetId) === String(selfId);
-    const isOwner = String(senderId) === String(cfg.ownerQQ ?? '');
+    const isOwner = Boolean(senderId && (String(senderId) === String(cfg.ownerQQ ?? '') || routerCfg.explicitOwnerIds.includes(String(senderId))));
     const msg = appendSocialV2Poke(key, {
       sender,
       userId: senderId || null,
@@ -12625,12 +12923,27 @@ async function main() {
     if (currentMode !== 'reserved2') return;
     if (socialV2.paused) return;
     const st = getSocialV2State(key);
-    if (!st.bootstrapSent) {
+    if (!st.bootstrapSent && !api?.isAgyBackend && !routerCfg.hasApiKey) {
       st.bootstrapSent = true;
       saveSocialV2State();
       scheduleWakeV2(key, 'bootstrap');
-    } else if (st.wakeConfig?.triggers?.poke) {
-      scheduleWakeV2(key, 'poke');
+    } else {
+      if (!st.bootstrapSent) {
+        st.bootstrapSent = true;
+        saveSocialV2State();
+      }
+      if (st.wakeConfig?.triggers?.poke) {
+        if (kind === 'group' && (api?.isAgyBackend || routerCfg.hasApiKey)) {
+          scheduleFlashReplyJudgeV2(key, st, 'poke', msg.text, {
+            explicitAtSelf: false,
+            quoteTargetIsSelf: false,
+            senderId,
+            senderLabel: sender,
+          });
+        } else {
+          scheduleWakeV2(key, 'poke');
+        }
+      }
     }
   }
 

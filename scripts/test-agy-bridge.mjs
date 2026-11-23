@@ -487,3 +487,201 @@ test('同名本地表情替换时库存数量不变也重载，旧 MD5 不能由
   cloud = ['https://fixture.invalid/' + old];
   assert.deepEqual(Array.from((await h.syncStickerLibrary(true)).entries, (e) => e.md5), [fresh]);
 });
+
+test('前置路由：OWNER_QQ_IDS 私聊零外部请求直通，群聊 gpt-6-luna 无推理分流与超时 @自身 降级兜底', async (t) => {
+  const routerCalls = [];
+  let routerBehavior = () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      model: 'gpt-6-luna',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: '{"should_reply":false,"reason":"仅提及热梗"}' }] }],
+    }),
+  });
+
+  const envContent = [
+    'OPENAI_API_KEY=sk-test-router-key',
+    'OPENAI_BASE_URL=https://router.example.invalid/v1',
+    'ROUTER_MODEL=gpt-6-luna',
+    'OWNER_QQ_IDS=123,8888',
+    'ROUTER_TIMEOUT_MS=80',
+  ].join('\n');
+
+  const h = await fixture(
+    t,
+    {
+      ...agy,
+      napcat: { account: '10000' },
+      persona: {
+        ...agy.persona,
+        nameKeywords: ['小鲸鱼', '鲸鱼'],
+        ambiguousKeywords: ['大肥鱼'],
+      },
+      socialV2: { wake: { batchWindowMs: 250, maxWakePerMinute: 60, maxWakePerHour: 600 } },
+    },
+    {
+      fetch: async (url, init = {}) => {
+        const u = String(url);
+        if (u.startsWith('https://router.example.invalid/')) {
+          const parsedBody = init?.body ? JSON.parse(String(init.body)) : {};
+          routerCalls.push({ url: u, body: parsedBody });
+          return routerBehavior(u, parsedBody, init);
+        }
+        return jsonResponse({ ok: true });
+      },
+    },
+    {
+      '.env': envContent,
+      'memory/owner/summary.md': '私聊专属约定',
+      'memory/groups/a/summary.md': '**青柠彗星** 群常驻摘要',
+      'roles/test-role.md': '绝密角色扮演人设正文不得外发',
+    }
+  );
+  h.setSelfIdentity('小鲸鱼', '10000');
+  const waitRouterWake = async (workerId = 'w1') => {
+    const res = await h.request(`/api/agy/wait-wake?timeoutMs=3500&workerId=${workerId}`);
+    assert.equal(res.status, 200, JSON.stringify(res.data));
+    assert.ok(res.data.wake, JSON.stringify(res.data));
+    return res.data.wake;
+  };
+
+  // 1) 私聊 OWNER_QQ_IDS 白名单（含仅在 .env 配置的 8888）：零外部请求直通
+  await h.handleIncoming('private', '8888', {
+    message_type: 'private',
+    self_id: 10000,
+    user_id: 8888,
+    message_id: 5001,
+    message: [{ type: 'text', data: { text: '在吗鲸鱼' } }],
+  }, h.cfg);
+  const privWake = await waitRouterWake('w1');
+  assert.equal(privWake.key, 'private:8888');
+  assert.equal(routerCalls.length, 0, '白名单私聊绝不能向外部路由 API 发起任何请求');
+  await finish(h, privWake.turn);
+
+  // 2) 非白名单私聊：直接拦截，零外部请求且不唤醒
+  await h.handleIncoming('private', '9999', {
+    message_type: 'private',
+    self_id: 10000,
+    user_id: 9999,
+    message_id: 5002,
+    message: [{ type: 'text', data: { text: '陌生人私聊' } }],
+  }, h.cfg);
+  assert.equal(routerCalls.length, 0);
+  assert.equal(h.api.agyStatus().queuedWakes, 0);
+
+  // 3) 群聊命中模糊词但 should_reply=false：校验无推理参数、无隐私注入，并静默拦截
+  await h.handleIncoming('group', '456', {
+    message_type: 'group',
+    group_id: 456,
+    self_id: 10000,
+    user_id: 234,
+    message_id: 6001,
+    sender: { nickname: '群友甲', card: '群友甲' },
+    message: [{ type: 'text', data: { text: '今天这条大肥鱼真鲜啊' } }],
+  }, h.cfg);
+  await eventually(() => routerCalls.length === 1);
+  assert.equal(routerCalls[0].url, 'https://router.example.invalid/v1/responses');
+  assert.equal(routerCalls[0].body.model, 'gpt-6-luna');
+  assert.deepEqual(routerCalls[0].body.reasoning, { effort: 'none' });
+  assert.ok(routerCalls[0].body.max_output_tokens <= 64);
+  const fullSentPayload = JSON.stringify(routerCalls[0].body);
+  assert.doesNotMatch(fullSentPayload, /绝密角色扮演人设|私聊专属约定|青柠彗星/, '外部路由请求严禁包含人设或任何记忆文件内容');
+  await new Promise((r) => setTimeout(r, 80));
+  assert.equal(h.api.agyStatus().queuedWakes, 0, 'should_reply=false 必须在 qq-bridge 层静默忽略');
+
+  // 4) 群聊 should_reply=true（同时验证 /responses 404 时兼容回退 /chat/completions reasoning_effort=none）
+  routerBehavior = (u, body) => {
+    if (u.endsWith('/responses')) {
+      return { ok: false, status: 404, text: async () => 'not found' };
+    }
+    assert.equal(body.reasoning_effort, 'none');
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({
+        model: 'gpt-6-luna',
+        choices: [{ message: { content: '{"should_reply":true,"reason":"群友直接向助手提问"}' } }],
+      }),
+    };
+  };
+  await h.handleIncoming('group', '456', {
+    message_type: 'group',
+    group_id: 456,
+    self_id: 10000,
+    user_id: 234,
+    message_id: 6002,
+    sender: { nickname: '群友乙', card: '群友乙' },
+    message: [{ type: 'text', data: { text: '小鲸鱼帮我算一下时间' } }],
+  }, h.cfg);
+  const groupWake = await waitRouterWake('w1');
+  assert.equal(groupWake.key, 'group:456');
+  await finish(h, groupWake.turn);
+
+  // 5) 外部路由超时报错兜底：非 @自身QQ号 静默忽略，明确包含 @自身QQ号 降级放行
+  routerBehavior = (_u, _body, init) => new Promise((_, reject) => {
+    init.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+  });
+  const callsBeforeTimeout = routerCalls.length;
+  await h.handleIncoming('group', '456', {
+    message_type: 'group',
+    group_id: 456,
+    self_id: 10000,
+    user_id: 234,
+    message_id: 6003,
+    sender: { nickname: '群友丙', card: '群友丙' },
+    message: [{ type: 'text', data: { text: '小鲸鱼在不在' } }],
+  }, h.cfg);
+  await eventually(() => routerCalls.length > callsBeforeTimeout);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(h.api.agyStatus().queuedWakes, 0, '路由超时且无明确 @自身QQ号 时应静默忽略');
+
+  await h.handleIncoming('group', '456', {
+    message_type: 'group',
+    group_id: 456,
+    self_id: 10000,
+    user_id: 234,
+    message_id: 6004,
+    sender: { nickname: '群友丁', card: '群友丁' },
+    message: [
+      { type: 'at', data: { qq: '10000' } },
+      { type: 'text', data: { text: ' 出来冒个泡' } },
+    ],
+  }, h.cfg);
+  const fallbackWake = await waitRouterWake('w1');
+  assert.equal(fallbackWake.key, 'group:456', '路由异常时明确包含 @自身QQ号 必须降级放行');
+  await finish(h, fallbackWake.turn);
+});
+
+test('出站客服拒答套话硬拦截（HTTP 422）、requeue 回退队首与 PowerShell 去引号 batch 解析', async (t) => {
+  const { parseUnquotedBatchItems } = await import('./agy-reply-and-wait.mjs');
+  const recovered = parseUnquotedBatchItems('[{reply:101,messages:[第一条消息,第二条消息]},{reply:102,sticker:abcd1234}]');
+  assert.deepEqual(recovered, [
+    { reply: '101', messages: ['第一条消息', '第二条消息'] },
+    { reply: '102', sticker: 'abcd1234' },
+  ]);
+
+  const h = await fixture(t, agy);
+  say(h, owner, 'Creator', '讲个故事', 901);
+  const w1 = await wake(h, owner);
+  const tok = h.getSocialV2State(owner).agentToken;
+
+  const blocked = await h.request('/api/socialV2/send-message', {
+    token: tok,
+    body: { key: owner, turn: w1.turn, messages: '抱歉，作为一个人工智能助手，我无法继续回应。' },
+  });
+  assert.equal(blocked.status, 422);
+  assert.equal(blocked.data.refusalBlocked, true);
+  assert.equal(h.calls.http.filter((c) => c.url.endsWith('/send_private_msg')).length, 0);
+
+  const reqRes = await h.request('/api/agy/requeue', {
+    body: { turn: w1.turn, workerId: 'w1' },
+  });
+  assert.equal(reqRes.status, 200);
+  assert.equal(reqRes.data.requeued, 1);
+
+  const w2 = await h.request('/api/agy/wait-wake?timeoutMs=2000&workerId=w2');
+  assert.equal(w2.status, 200);
+  assert.equal(w2.data.wake.key, owner);
+  assert.equal(w2.data.wake.requeuedCount, 1);
+  await finish(h, w2.data.wake.turn);
+});

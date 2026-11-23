@@ -13,6 +13,7 @@ import { napcatLoginConfig } from '../src/napcat-config.js';
 import { createTurnClaims } from '../src/agy-turn-claims.js';
 import { createMemoryCompartments } from '../src/memory-compartment.js';
 import { createArchiveChannel, createFlashJudge } from '../src/agy-coordinator.js';
+import { resolveRouterConfig, hasExplicitAtSelf } from '../src/message-router.js';
 import { handleAgyRequest } from '../src/agy-routes.js';
 import { readConsolePage, consoleLoginPage } from '../src/webui-page.js';
 import * as markdown from '../src/md-to-plain.js';
@@ -184,7 +185,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   const context = vm.createContext({
     fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
     recoverNapcatLogin, loginAttemptFile, napcatLoginConfig,
-    createTurnClaims, createMemoryCompartments, createArchiveChannel, createFlashJudge, handleAgyRequest,
+    createTurnClaims, createMemoryCompartments, createArchiveChannel, createFlashJudge,
+    resolveRouterConfig, hasExplicitAtSelf, handleAgyRequest,
     readConsolePage, consoleLoginPage, fetch: fakeFetch,
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
