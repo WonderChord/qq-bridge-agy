@@ -27,6 +27,7 @@ DSH/                         ← 工作区根（不是仓库根）
 | `plugins/` | DSH 插件：`qq-mode-console`（暴露 `qq-mode` 设置命名空间；**只有 host 半**，浏览器 UI 卡片未实现）、`qq-agent-presets`（生成两个 preset 行 + 携带唯一的 `qq-tool-restrict` 权威实现） | 改了要重装/重启 DSH |
 | `public/` | 浏览器静态资源：`console.html`（桥接自带控制台，127.0.0.1:3100） | 目录里只应有这一个文件；历史备份 `console.html.bak` 已移出仓库 |
 | `roles/` | 人格卡（`小鲸鱼.md` / `傲娇助手.md` / `README.md`）：控制台「人格与角色」页可编辑，保存即生效 | 用户内容，别乱动 |
+| `templates/` | **跨载体宿主全局规则脱敏母版**（`GEMINI.example.md` / `AGENTS.example.md` / `README.md`），供部署者复制填槽到 `~/.gemini/config/GEMINI.md` 或工作区 `AGENTS.md` | 脱敏模板，禁填真实隐私路径 |
 | `agy-plugin/` | **Antigravity 插件模板**（`plugin.json`、`mcp_config.json`、零继承极简子代理 `agents/*.md`、`skills/qq-bot-operator/SKILL.md` 及一键安装脚本 `install.ps1`） | 改子代理规程时同步更新 |
 | `memory/` | **分舱长期记忆目录**（按 `config.json → persona.memoryCompartments` 分舱存放 `summary.md` 与 `diary/`；个人记忆内容已被 `.gitignore` 排除，仅保留 `README.md`） | 用户运行数据，不入库 |
 | `stickers/` | **表情包图片目录**（收藏表情与自制表情文件，索引在 `state/stickers.json`；图片已被 `.gitignore` 排除，仅保留 `README.md`） | 用户运行数据，不入库 |

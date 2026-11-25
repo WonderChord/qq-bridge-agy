@@ -87,6 +87,7 @@
 ```
 
 - 每个群与私聊使用独立目录物理隔离。群聊默认单向只读挂载 Creator 私聊摘要（设 `includePrivate: false` 可关闭），归档只写回本会话目录。分舱记忆规范详见 [群友人设总结与双层记忆归档指南](MEMORY_ARCHIVE_GUIDE.md)。
+- 若希望在 Antigravity、Codex CLI 与 Claude Code 桌面日常协作中也锚定同一鲜活人格（覆盖默认冷淡同事腔与 `commentary` 机器播报），可复制 [`templates/GEMINI.example.md`](../../templates/GEMINI.example.md) 与 [`templates/AGENTS.example.md`](../../templates/AGENTS.example.md) 填槽使用，说明见 [`templates/README.md`](../../templates/README.md)。
 
 ## 四、`napcat`：无头 NapCat 守护
 
