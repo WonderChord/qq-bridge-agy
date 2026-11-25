@@ -685,3 +685,81 @@ test('出站客服拒答套话硬拦截（HTTP 422）、requeue 回退队首与 
   assert.equal(w2.data.wake.requeuedCount, 1);
   await finish(h, w2.data.wake.turn);
 });
+
+test('协同助手多线程：auto 模式下 voice/search/draw 在线接管与离线降级，off/单项关闭时强制走单主线程直连', async (t) => {
+  const synthInputs = [];
+  const h = await fixture(
+    t,
+    {
+      ...agy,
+      ...voiceConfig,
+      socialV2: {
+        ...voiceConfig.socialV2,
+        helpers: { mode: 'auto', voice: true, search: true, draw: true, voiceTimeoutMs: 5000, searchTimeoutMs: 5000, drawTimeoutMs: 5000 },
+      },
+    },
+    {
+      synthesizeSpeech: async (segText, _cfg, snap) => {
+        synthInputs.push({ segText, ttsRef: snap?.ttsRef || '' });
+        return { audio: Buffer.alloc(512), provider: 'fixture' };
+      },
+      inspectAudio: async () => ({ ok: true, size: 512, duration: 1, codec: 'mp3' }),
+    }
+  );
+  const tok = h.getSocialV2State(owner).agentToken;
+
+  // 1) search 助手未上线时，helper-submit 返回 offline=true（供 agy-ask-search 自动降级本地搜索）
+  const offlineSearch = await h.request('/api/agy/helper-submit', {
+    body: { role: 'search', requireOnline: true, waitResult: true, payload: { mode: 'sync', query: '测试离线降级' } },
+  });
+  assert.equal(offlineSearch.data.ok, false);
+  assert.equal(offlineSearch.data.offline, true);
+
+  // 2) search 助手挂起监听后，同步委托返回精炼摘要
+  const searchWaitPromise = h.request('/api/agy/helper-wait?role=search&workerId=s1&timeoutMs=4000');
+  await new Promise((r) => setTimeout(r, 40));
+  const submitPromise = h.request('/api/agy/helper-submit', {
+    body: { role: 'search', requireOnline: true, waitResult: true, payload: { mode: 'sync', query: '核实新版本特性' } },
+  });
+  const searchJobRes = await searchWaitPromise;
+  assert.equal(searchJobRes.data.ok, true);
+  assert.equal(searchJobRes.data.job.payload.query, '核实新版本特性');
+  await h.request('/api/agy/helper-done', {
+    body: { id: searchJobRes.data.job.id, result: { summary: '浓缩后的两百字查证结论' } },
+  });
+  const searchOut = await submitPromise;
+  assert.equal(searchOut.data.ok, true);
+  assert.equal(searchOut.data.completed, true);
+  assert.equal(searchOut.data.result.summary, '浓缩后的两百字查证结论');
+
+  // 3) voice 助手在线时，async send-tts 自动交由语音导演精修后再合成发往 QQ
+  const voiceWaitPromise = h.request('/api/agy/helper-wait?role=voice&workerId=v1&timeoutMs=4000');
+  await new Promise((r) => setTimeout(r, 40));
+  const ttsQueued = await h.request('/api/socialV2/send-tts', {
+    token: tok,
+    body: { key: owner, text: '原始草稿台词', voiceBrief: true, async: true, verify: false },
+  });
+  assert.equal(ttsQueued.status, 200);
+  assert.equal(ttsQueued.data.queued, true);
+  const voiceJobRes = await voiceWaitPromise;
+  assert.equal(voiceJobRes.data.job.payload.rawText, '原始草稿台词');
+  assert.equal(voiceJobRes.data.job.payload.voiceBrief, true);
+  await h.request('/api/agy/helper-done', {
+    body: { id: voiceJobRes.data.job.id, result: { segments: ['[playful cute voice] 导演精修后的正式台本'], ttsRef: '02_tsukkomi' } },
+  });
+  await eventually(() => synthInputs.some((x) => x.segText.includes('导演精修后的正式台本') && x.ttsRef === '02_tsukkomi'));
+
+  // 4) 通过配置将 helpers.mode 设为 off（或单项关闭）时，即使曾有监听也立即拒绝派单并标记 enabled=false
+  h.cfg.socialV2.helpers.mode = 'off';
+  const statusOff = (await h.request('/api/agy/status')).data;
+  assert.equal(statusOff.helpersMode, 'off');
+  assert.equal(statusOff.helpersEnabled, false);
+  assert.equal(statusOff.helpers.search.enabled, false);
+  assert.equal(statusOff.helpers.voice.online, false);
+
+  const disabledSubmit = await h.request('/api/agy/helper-submit', {
+    body: { role: 'search', requireOnline: true, waitResult: true, payload: { mode: 'sync', query: '已关闭多线程' } },
+  });
+  assert.equal(disabledSubmit.data.ok, false);
+  assert.equal(disabledSubmit.data.disabled, true);
+});

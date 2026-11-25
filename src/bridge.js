@@ -8,6 +8,7 @@
 import { createTurnClaims } from './agy-turn-claims.js';
 import { createMemoryCompartments } from './memory-compartment.js';
 import { createArchiveChannel, createFlashJudge } from './agy-coordinator.js';
+import { createHelperHub } from './agy-helpers.js';
 import { resolveRouterConfig, hasExplicitAtSelf } from './message-router.js';
 import { handleAgyRequest } from './agy-routes.js';
 import { readConsolePage, consoleLoginPage } from './webui-page.js';
@@ -952,6 +953,21 @@ function loadConfig() {
     ffmpegPath: '',
     autoReadback: true,
     ...(cfg.socialV2?.voice ?? {})
+  };
+
+  cfg.socialV2.helpers = {
+    mode: 'auto',
+    voice: true,
+    search: true,
+    draw: true,
+    voiceTimeoutMs: 45000,
+    searchTimeoutMs: 36000,
+    drawTimeoutMs: 75000,
+    ...((cfg.socialV2?.helpers && typeof cfg.socialV2.helpers === 'object' && !Array.isArray(cfg.socialV2.helpers))
+      ? cfg.socialV2.helpers
+      : (typeof cfg.socialV2?.helpers === 'boolean'
+        ? { enabled: cfg.socialV2.helpers, mode: cfg.socialV2.helpers ? 'auto' : 'off' }
+        : {}))
   };
 
   // socialV2.sticker.collect 也需要深度合并，避免旧配置缺失 collect 子项时丢默认值。
@@ -3668,6 +3684,7 @@ async function main() {
   let codexDrawInFlight = 0;
   const codexDrawTimes = [];
   const archive = createArchiveChannel(log);
+  const helpers = createHelperHub(log, { getConfig: () => cfg.socialV2?.helpers, env: process.env });
   const claims = createTurnClaims(api, (key) => state.sessions[key]);
   const { checkTurnActionV2, shouldBlockDuplicateGroupReplyV2, claimOutboundUniqueMessagesV2,
     getAgyClaimedSeq, registerClaimedSliceOwnersV2 } = claims;
@@ -3988,7 +4005,7 @@ async function main() {
         }
         // ── Antigravity 本地唤醒通道（仅持有 consoleToken 的本机守护脚本可访问） ──
         if (url.pathname.startsWith('/api/agy/') && await handleAgyRequest({
-          req, res, url, sendJson, readBody, api, judge: flashJudge, archive, memory,
+          req, res, url, sendJson, readBody, api, judge: flashJudge, archive, helpers, memory,
           getMode: () => currentMode, dshReady, snowlumaHealth, agentTokenOk, v2SessionAllowed,
           socialV2, cfg, state, reverse, getSocialV2State, log,
         })) return;
@@ -6454,40 +6471,86 @@ async function main() {
               claims.recordTurnAction(key, body.turn, asyncActionSig);
               const stNow = getSocialV2State(key);
               if (stNow) stNow.lastActionAt = Date.now();
+              const recentContextSnap = (stNow?.recentMessages || [])
+                .slice(-4)
+                .map((m) => `${m.sender}: ${String(m.plain || m.text || '').slice(0, 140)}`);
               sendJson({ ok: true, queued: true, key, segments: segments.length });
               const bodySnap = { ...body, turn: '' };
-              ttsAsyncChain = ttsAsyncChain.catch(() => {}).then(async () => {
-                const bgFiles = [];
-                try {
-                  for (let i = 0; i < segments.length; i += 1) {
-                    const segText = segments[i];
-                    const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
-                    const filePath = path.join(ttsDir, fileName);
-                    bgFiles.push(filePath);
-                    const segLabel = segments.length > 1
-                      ? `[语音 ${i + 1}/${segments.length}] ${segText.slice(0, 80)}`
-                      : '[语音] ' + text.slice(0, 80);
-                    await sendVoiceForV2(key, fileName, {
-                      label: segLabel,
-                      verify: bodySnap.verify,
-                      guard,
-                      turn: '',
-                      prepare: async () => {
-                        const result = await synthesizeSpeech(segText, cfg.socialV2.tts, bodySnap, voice.maxBytes);
-                        fs.mkdirSync(ttsDir, { recursive: true });
-                        fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
-                        return filePath;
-                      },
-                    });
-                  }
-                } catch (err) {
-                  log(`[voice] 异步 TTS 合成/投递未完成 (${key}): ${err?.message ?? err}`);
-                } finally {
-                  for (const fp of bgFiles) {
-                    if (fs.existsSync(fp)) setTimeout(() => { try { fs.unlinkSync(fp); } catch {} }, 15000).unref();
+              void (async () => {
+                let effectiveSegments = body.split === false
+                  ? segments
+                  : splitDrama3TextForTts(text, isLocalGpuTts ? Math.min(maxSegChars, 78) : maxSegChars);
+                if (bodySnap.direct !== true && helpers.canDispatch('voice')) {
+                  const directed = await helpers.enqueue('voice', {
+                    key,
+                    rawText: text,
+                    voiceBrief: bodySnap.voiceBrief === true,
+                    chineseContext: String(bodySnap.chineseContext || '').slice(0, 500),
+                    situationMemo: String(bodySnap.situationMemo || '').slice(0, 240),
+                    ttsRef: String(bodySnap.ttsRef || ''),
+                    recentContext: recentContextSnap,
+                  }, { waitResult: true, timeoutMs: helpers.defaultTimeoutMs('voice') });
+                  if (directed?.completed && directed.result) {
+                    const r = directed.result;
+                    const rawOutList = Array.isArray(r.segments) && r.segments.length > 0
+                      ? r.segments
+                      : (r.text ? [String(r.text)] : []);
+                    const cleaned = rawOutList.map((x) => String(x || '').trim()).filter(Boolean);
+                    if (cleaned.length > 0) {
+                      effectiveSegments = [];
+                      for (const item of cleaned) {
+                        for (const seg of splitDrama3TextForTts(item, isLocalGpuTts ? 78 : maxSegChars)) {
+                          if (seg.trim()) effectiveSegments.push(seg.trim());
+                        }
+                      }
+                      if (r.ttsRef) bodySnap.ttsRef = String(r.ttsRef).trim();
+                      log(`[voice] 语音导演线程已完成台本精修 (${key}): ${effectiveSegments.length} 段, ref=${bodySnap.ttsRef || 'auto'}`);
+                    }
+                  } else {
+                    log(`[voice] 语音导演线程超时或跳过 (${key})，回退原台本`);
                   }
                 }
-              });
+                const targetProvider = String(bodySnap.provider || cfg.socialV2?.tts?.provider || '');
+                if (bodySnap.voiceBrief === true && effectiveSegments === segments && (targetProvider === 'fish' || targetProvider === 'fish_local')) {
+                  // 日语 Drama3 引擎下纯中文 voiceBrief 未获日语导演转换时安全跳过，防止把中文意图塞进日语 TTS
+                  if (!/[\u3040-\u309f\u30a0-\u30ff]/.test(text)) {
+                    log(`[voice] 纯中文 voiceBrief 未获语音导演转换，已安全跳过 (${key})`);
+                    return;
+                  }
+                }
+                ttsAsyncChain = ttsAsyncChain.catch(() => {}).then(async () => {
+                  const bgFiles = [];
+                  try {
+                    for (let i = 0; i < effectiveSegments.length; i += 1) {
+                      const segText = effectiveSegments[i];
+                      const fileName = '_tts_' + crypto.randomUUID() + '.mp3';
+                      const filePath = path.join(ttsDir, fileName);
+                      bgFiles.push(filePath);
+                      const segLabel = effectiveSegments.length > 1
+                        ? `[语音 ${i + 1}/${effectiveSegments.length}] ${segText.slice(0, 80)}`
+                        : '[语音] ' + segText.slice(0, 80);
+                      await sendVoiceForV2(key, fileName, {
+                        label: segLabel,
+                        verify: bodySnap.verify,
+                        guard,
+                        turn: '',
+                        prepare: async () => {
+                          const result = await synthesizeSpeech(segText, cfg.socialV2.tts, bodySnap, voice.maxBytes);
+                          fs.mkdirSync(ttsDir, { recursive: true });
+                          fs.writeFileSync(filePath, result.audio, { flag: 'wx', mode: 0o600 });
+                          return filePath;
+                        },
+                      });
+                    }
+                  } catch (err) {
+                    log(`[voice] 异步 TTS 合成/投递未完成 (${key}): ${err?.message ?? err}`);
+                  } finally {
+                    for (const fp of bgFiles) {
+                      if (fs.existsSync(fp)) setTimeout(() => { try { fs.unlinkSync(fp); } catch {} }, 15000).unref();
+                    }
+                  }
+                });
+              })();
               return;
             }
             const tempFiles = [];
@@ -6930,10 +6993,34 @@ async function main() {
                   }
                 }
               }
+              let effectivePrompt = prompt;
+              let effectiveSelfRef = selfRef;
+              if (body.direct !== true && helpers.canDispatch('draw')) {
+                const polishOut = await helpers.enqueue('draw', {
+                  jobId,
+                  key,
+                  prompt,
+                  selfRef,
+                  asSticker,
+                  note,
+                  tags,
+                  refFiles: tempRefFiles,
+                  recentContext: (st.recentMessages || [])
+                    .slice(-4)
+                    .map((m) => `${m.sender}: ${String(m.plain || m.text || '').slice(0, 140)}`),
+                }, { waitResult: true, timeoutMs: helpers.defaultTimeoutMs('draw') });
+                if (polishOut?.completed && polishOut.result?.prompt) {
+                  effectivePrompt = String(polishOut.result.prompt).trim().slice(0, 2500) || prompt;
+                  if (typeof polishOut.result.selfRef === 'boolean') effectiveSelfRef = polishOut.result.selfRef;
+                  log(`[codex-draw] 绘图助手已完成画面导演精修 ${jobId} (${effectivePrompt.length} 字, selfRef=${effectiveSelfRef})`);
+                } else {
+                  log(`[codex-draw] 绘图助手超时或跳过 (${jobId})，回退原描述直接生图`);
+                }
+              }
               const outFile = path.join(DRAWN_DIR, `${jobId}.png`);
               const drawRes = await runCodexDraw({
-                prompt,
-                selfRef,
+                prompt: effectivePrompt,
+                selfRef: effectiveSelfRef,
                 refs: tempRefFiles,
                 out: outFile,
                 timeoutSec: 240

@@ -1,8 +1,8 @@
 {
   "name": "qq-bridge",
   "displayName": "QQ Bridge (NapCat)",
-  "description": "NapCat OneBot v11 与 Antigravity 之间的 QQ 机器人桥接插件：网桥本地前置分流路由、单主对话 Worker 30/20 轮换新、低频防卡死巡检与本地分舱记忆归档。",
-  "version": "0.4.0",
+  "description": "NapCat OneBot v11 与 Antigravity 之间的 QQ 机器人桥接插件：网桥本地前置分流路由，支持轻量双线程或「主对话 + 语音导演 + 后台搜索 + 绘图助手 + 记忆归档」可配置多线程协同。",
+  "version": "0.5.0",
   "suggestedPrompts": [
     "启动 QQ 机器人全自动值守",
     "查看 QQ 桥接与 NapCat 当前连接状态",

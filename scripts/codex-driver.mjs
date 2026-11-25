@@ -247,11 +247,11 @@ function buildWorkerPreamble() {
 
 ## 每次唤醒的做法
 1. 按唤醒文本里注入的角色卡、分舱记忆与表情短 ID 清单进入角色；只回 messages 里的新消息（recent 只作语境）；收到【主动冒泡】时主动发 1 条不带 --reply 的短句/表情/语音。
-2. 确实需要联网核实时，只用一次 node "${rootPosix}/scripts/agy-web-search.mjs" '可公开的关键词'。结果为空、报错或超时时，下一步就调用回信命令，用现有信息如实回答。
+2. 确实需要联网核实时，只用一次 node "${rootPosix}/scripts/agy-ask-search.mjs" '可公开的关键词'（搜索助手在线时返回精炼干货，否则自动降级本地搜索）。结果为空、报错或超时时，下一步就调用回信命令，用现有信息如实回答。
    对方明确让看图时先跑 node "${rootPosix}/scripts/agy-get-image.mjs" --key "<Key>" --token "<Token>" --msg "<msgId>" 落盘再查看图片；私聊追忆早期事件可查分舱目录下的 event_book.md 或跑 node "${rootPosix}/scripts/agy-recall-group.mjs" '<关键词>'。
 3. 只调用 1 次回信命令（环境变量 QQ_BRIDGE_FORCE_NO_WAIT=1 已设置，命令发完立即返回），然后只回复 OK 结束本轮：
    node "${rootPosix}/scripts/agy-reply-and-wait.mjs" --worker-id w1 --max-turns 0 --priority 10 --finish-turn "<Turn>" --key "<Key>" --token "<Token>" --seq <readThroughSeq> --reply "<msgId>" '回复短句' --sticker "<短id>"
-   - 带语音条：同命令加单条完整 --tts '[演技基调] 口语台词'（发外语语音时同命令须附带对应中文文本）
+   - 带语音条：若语音导演线程在线可加 --voice-brief '想说的台词意图或草稿' 异步精修合成；若直传 --tts，按真实情绪选句首指令（调侃 [playful impish teasing, cute expressive voice] / 抗议害羞 [flustered shy protest, cute expressive voice] / 高张力喘息 [breathless trembling emotion, expressive gasping voice] / 哄睡余韵 [breathless melting whisper, slow lingering intimate tone]，切勿在高张力场景误套 unhurried gentle），发外语语音时同命令须附带对应中文文本。
    - 同批回多人时，将 JSON 经标准输入传给 --batch-stdin，保留所有引号：
      $OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 @'
@@ -522,7 +522,7 @@ function cleanupOthers(selfPid) {
   for (const p of listNodeProcs()) {
     const cmd = String(p.CommandLine || '');
     if (Number(p.ProcessId) === selfPid || Number(p.ParentProcessId) === selfPid) continue;
-    if (/codex-driver\.mjs"?\s+run/.test(cmd) || /agy-wait-(wake|judge|archive)|agy-reply-and-wait/.test(cmd)) {
+    if (/codex-driver\.mjs"?\s+run/.test(cmd) || /agy-wait-(wake|judge|archive|voice|search|draw)|agy-reply-and-wait/.test(cmd)) {
       log(`[cleanup] stop PID ${p.ProcessId}: ${cmd.slice(0, 120)}`);
       killPid(p.ProcessId);
     }
@@ -589,7 +589,7 @@ function cmdStop() {
   if (st) { killPid(st.pid); console.log(`已停止 Codex 守护驱动器 PID ${st.pid}`); }
   else console.log('Codex 守护驱动器未在运行');
   for (const p of listNodeProcs()) {
-    if (/agy-wait-(wake|judge|archive)/.test(String(p.CommandLine || '')) && Number(p.ParentProcessId) === Number(st?.pid)) killPid(p.ProcessId);
+    if (/agy-wait-(wake|judge|archive|voice|search|draw)/.test(String(p.CommandLine || '')) && Number(p.ParentProcessId) === Number(st?.pid)) killPid(p.ProcessId);
   }
 }
 

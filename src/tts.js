@@ -148,11 +148,27 @@ export function classifySegmentPacing(text) {
   const whisperChars = [...s.matchAll(/<(?:whisper|soft|slow)>([\s\S]*?)<\/(?:whisper|soft|slow)>/gi)]
     .reduce((acc, m) => acc + countSpokenChars(m[1]), 0);
   const whisperRatio = whisperChars / plainLen;
+  const isTrueSleepAfterglow = /おやすみ|眠|二度寝|余韻|事後|うとうと|寝ぼけ|力入らない|動かせない|気絶しちゃ|ぽかぽか|抱き枕|ゆっくり休/i.test(s);
+  const isHighTension = /ひゃあっ|ひゃあぁ|きゃあっ|あぁっ|はぁあっ|んぁあっ|あんっ|気持ちよすぎ|壊れちゃ|おかしく|頭真っ白|火花|限界|(?:\[panting\][\s\S]*){2,}/i.test(s);
 
-  // 1) 慢档（弛）：哄睡、事后余韵、全身脱力、显式 slow/melting 指令、或整句以 <whisper>/<soft> 耳语为主
+  // 1) 高张力起伏档（优先于 whisperRatio，防止高情绪起伏台词因局部 <whisper> 被误判成哄睡慢档）
+  if (isHighTension && !isTrueSleepAfterglow) {
+    const hasSmugTease = /くふふ|ふふっ|えへへ/i.test(s);
+    return {
+      mode: 'dynamic_climax',
+      speed: 1.02,
+      silenceStopSec: 0.95,
+      silenceKeepSec: 0.42,
+      defaultDir: '[breathless trembling emotion, expressive gasping voice]',
+      preferredRef: hasSmugTease ? '06_smug_gamer' : '02_tsukkomi',
+    };
+  }
+
+  // 2) 慢档（弛）：真正的哄睡、余韵放松，或非高张力场景下整句以 <whisper>/<soft> 耳语为主
   if (
-    whisperRatio >= 0.35
-    || /\bslow\b|\bmelting\b|\blingering\b|おやすみ|眠|二度寝|余韻|事後|うとうと|寝ぼけ|力入らない|動かせない|気絶しちゃ|ぽかぽか|タプタプ|栓をしたまま|抱き枕|ゆっくり/i.test(s)
+    isTrueSleepAfterglow
+    || whisperRatio >= 0.45
+    || (/\bslow\b|\bmelting\b|\blingering\b/i.test(s) && !isHighTension)
   ) {
     return {
       mode: 'slow_afterglow',
@@ -164,11 +180,11 @@ export function classifySegmentPacing(text) {
     };
   }
 
-  // 2) 快档（张）：小恶魔促狭坏笑、傲娇/冷娇女神斥责、害羞慌张抢白抗议、或 VTuber 元气向观众打招呼
+  // 3) 快档（张）：促狭调侃、傲娇回嘴、害羞慌张抗议、或元气打招呼
   if (
-    /<fast>|<stress>|<forceful>|くふふ|ふふっ|えへへ|ざぁこ|バレバレ|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|だ、だめ|ちょ、ちょっと|ヤッホー|おはよ|リスナー|みんな/i.test(s)
+    /<fast>|<stress>|<forceful>|くふふ|ふふっ|えへへ|バレバレ|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|だ、だめ|ま、待って|ちょ、ちょっと|ヤッホー|おはよ|リスナー|みんな/i.test(s)
   ) {
-    const isTsundere = /<stress>|<forceful>|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|怒|だ、だめ|ちょ、ちょっと/i.test(s);
+    const isTsundere = /<stress>|<forceful>|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|怒|だ、だめ|ま、待って|ちょ、ちょっと/i.test(s);
     return {
       mode: 'brisk_tease_fluster',
       speed: 1.04,
@@ -181,26 +197,19 @@ export function classifySegmentPacing(text) {
     };
   }
 
-  // 3) 急促起伏档：激烈快感、快要登顶、连声娇喘
-  if (/ひゃあっ|ひゃあぁ|きゃあっ|あぁっ|イく|イっちゃ|イかされ|気持ちよすぎ|壊れちゃ|おかしく|頭真っ白|火花|限界/i.test(s)) {
-    return {
-      mode: 'dynamic_climax',
-      speed: 1.0,
-      silenceStopSec: 1.05,
-      silenceKeepSec: 0.48,
-      defaultDir: '[breathless trembling pleasure, sweet gasping voice]',
-      preferredRef: '04_shy_flustered',
-    };
-  }
-
-  // 4) 默认温存档：原速 1.00，完整保留吐息、省略号欲言又止与句间自然换气，绝不急促抢话
+  // 4) 默认温存档：原速 1.00，完整保留吐息、省略号欲言又止与句间自然换气
+  const isQuietShyConfession = /胸がきゅっ|ドキドキ|恥ずかし|照れ/i.test(s);
   return {
     mode: 'modulated_sweet',
     speed: 1.0,
     silenceStopSec: 1.15,
     silenceKeepSec: 0.58,
-    defaultDir: '[soft sweet breath, unhurried gentle intimate pace]',
-    preferredRef: /んちゅ|ちゅっ|にゃあ|とろけ|甘え|ご主人様|クリエイター/i.test(s) ? '03_nadenade' : '01_default',
+    defaultDir: isQuietShyConfession
+      ? '[shy fluttering confession, soft sweet voice]'
+      : '[playful sweet affectionate voice, warm expressive tone]',
+    preferredRef: isQuietShyConfession
+      ? '04_shy_flustered'
+      : (/ちゅっ|とろけ|甘え|ご主人様|クリエイター/i.test(s) ? '03_nadenade' : '01_default'),
   };
 }
 
@@ -312,16 +321,20 @@ export function normalizeDrama3Text(rawText) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  // 3) 按本段情感与节奏分类，智能匹配或压缩句首演技指令（尊重已有的 slow/whisper/gentle/pace 慢速留白指令，绝不强塞加速词）
-  const pacing = classifySegmentPacing(`${leadDir} ${body}`);
+  // 3) 按本段情感与节奏分类，智能匹配或修正句首演技指令（防止高张力台词被误套 unhurried/slow 平缓模板）
+  const pacing = classifySegmentPacing(body);
   if (!leadDir || (Buffer.byteLength(leadDir, 'utf8') > 85 && !/[a-zA-Z]{3}/.test(leadDir))) {
+    leadDir = pacing.defaultDir;
+  } else if (pacing.mode === 'dynamic_climax' && /unhurried|slow|lingering|calm|bedtime|sleepy/i.test(leadDir)) {
     leadDir = pacing.defaultDir;
   } else if (pacing.mode === 'slow_afterglow' && /間延びせず|早口|軽快|brisk|fast|bouncy/i.test(leadDir)) {
     leadDir = pacing.defaultDir;
+  } else if (pacing.mode === 'brisk_tease_fluster' && /unhurried|slow|lingering/i.test(leadDir)) {
+    leadDir = pacing.defaultDir;
   } else if (pacing.mode === 'brisk_tease_fluster' && !/テンポ|軽快|早口|慌てて|弾む|brisk|playful|flustered|lively|fast|bouncy|cute/i.test(leadDir)) {
     leadDir = leadDir.replace(/^\[/, '[playful cute voice, ');
-  } else if (pacing.mode === 'modulated_sweet' && !/緩急|テンポ|pace|conversational|warm|modulated|gentle|slow|whisper|intimate|lingering/i.test(leadDir)) {
-    leadDir = leadDir.replace(/^\[/, '[soft sweet breath, unhurried gentle pace, ');
+  } else if (pacing.mode === 'modulated_sweet' && !/緩急|テンポ|pace|conversational|warm|modulated|gentle|slow|whisper|intimate|lingering|expressive|playful|sweet/i.test(leadDir)) {
+    leadDir = leadDir.replace(/^\[/, '[warm sweet expressive voice, ');
   }
 
   return `${leadDir} ${body}`.trim();
@@ -644,23 +657,32 @@ export function selectArisReference(text, preferredRef, refs) {
   const t = String(text || '');
   const findById = (sub) => refs.find((r) => r.id.includes(sub));
 
-  // 02: 傲娇吐槽 / 冷娇女神斥责 / 回嘴抗议 / 气鼓鼓（语速干脆有张力）
-  if (/<stress>|<forceful>|\[(?:indignant|disdainful|angry|annoyed|frustrated|sarcastic)\]|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|いじわる|怒|からかって|騙され|吐槽|抗议|生气|嫌弃/i.test(t)) {
+  // 02/06: 高张力激动 / 急促喘息（避免落入平静的 04 号轻柔底音，优先走高低起伏大的 02 或灵动调侃的 06）
+  if (/ひゃあっ|きゃあっ|あぁっ|はぁあっ|んぁあっ|気持ちよすぎ|壊れちゃ|もうダメ|限界/i.test(t)) {
+    const r = /くふふ|ふふっ|えへへ/i.test(t)
+      ? (findById('06_smug_gamer') || findById('02_tsukkomi'))
+      : (findById('02_tsukkomi') || findById('03_nadenade'));
+    if (r) return r;
+  }
+  // 02: 傲娇吐槽 / 回嘴抗议 / 气鼓鼓（语速干脆有张力）
+  if (/<stress>|<forceful>|\[(?:indignant|disdainful|angry|annoyed|frustrated|sarcastic|flustered)\]|恥知らず|無礼|不届き|生意気|ふん|むっ|もう！|バカ|いじわる|怒|からかって|騙され|ま、待って|だ、だめ|吐槽|抗议|生气|嫌弃/i.test(t)) {
     const r = findById('02_tsukkomi');
     if (r) return r;
   }
-  // 06: 电玩耍宝 / 得意坏笑 / 慌张心虚抢白（语速最轻快）
-  if (/<fast>|\[(?:smug|guilty|panicked|nervous)\]|くふふ|ふふっ|えへへ|ヤッホー|おはよ|お疲れ|クール|低い声|ゲーセン/i.test(t)) {
-    const r = findById('05_happy_clingy') || findById('01_default');
+  // 05/06: 灵动调侃 / 得意轻笑 / 元气打招呼（语速轻快富有弹性）
+  if (/<fast>|\[(?:smug|guilty|panicked|nervous|playful|impish)\]|くふふ|ふふっ|えへへ|ヤッホー|おはよ|お疲れ|クール|低い声|ゲーセン/i.test(t)) {
+    const r = /くふふ～|照れる表情|好きなん/i.test(t)
+      ? (findById('06_smug_gamer') || findById('05_happy_clingy'))
+      : (findById('05_happy_clingy') || findById('01_default'));
     if (r) return r;
   }
-  // 04: 激烈动情 / 羞怯慌乱 / 登顶喘息（语速富有起伏）
-  if (/ひゃあっ|きゃあっ|あぁっ|イく|イっちゃ|気持ちよすぎ|壊れちゃ|もうダメ|限界/i.test(t)) {
+  // 04: 安静羞怯 / 小鹿乱撞表白（仅限轻柔害羞情话）
+  if (/胸がきゅっ|ドキドキ|恥ずかし|照れ/i.test(t)) {
     const r = findById('04_shy_flustered') || findById('03_nadenade');
     if (r) return r;
   }
-  // 03: 贴耳温存 / 哄睡 / 黏人撒娇（已做 1.18x 提速与去静音优化）
-  if (/<whisper>|おやすみ|眠|二度寝|とろけ|んちゅ|ちゅっ|にゃあ/i.test(t)) {
+  // 03: 贴耳温存 / 哄睡 / 温柔安抚
+  if (/<whisper>|おやすみ|眠|二度寝|とろけ|ちゅっ/i.test(t)) {
     const r = findById('03_nadenade') || findById('01_default');
     if (r) return r;
   }

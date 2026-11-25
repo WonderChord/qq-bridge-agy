@@ -3,11 +3,12 @@ const aliases = {
   '/api/agy/finish-turn': '/api/agy/complete',
   '/api/agy/wait-judge': '/api/agy/judge-wait',
   '/api/agy/wait-archive': '/api/agy/archive-wait',
+  '/api/agy/wait-helper': '/api/agy/helper-wait',
 };
 
 // 入口处已统一验证 Host、控制台令牌和智能体权限。这里保留各业务端点的会话校验。
 export async function handleAgyRequest({
-  req, res, url, sendJson, readBody, api, judge, archive, memory,
+  req, res, url, sendJson, readBody, api, judge, archive, helpers, memory,
   getMode, dshReady, snowlumaHealth, agentTokenOk, v2SessionAllowed,
   socialV2, cfg, state, reverse, getSocialV2State, log,
 }) {
@@ -24,6 +25,7 @@ export async function handleAgyRequest({
       snowluma: snowlumaHealth,
       ...judge.status(),
       ...archive.status(),
+      ...(helpers ? helpers.status() : {}),
       ...api.agyStatus(),
       loadedSignatures: memory.loadedSignatures(),
     });
@@ -52,6 +54,67 @@ export async function handleAgyRequest({
       timedOut: !!outcome.timedOut,
       job: outcome.job ?? null,
     });
+    return true;
+  }
+  if (helpers && req.method === 'GET' && pathname === '/api/agy/helper-wait') {
+    const role = String(url.searchParams.get('role') || '').trim().toLowerCase();
+    const workerId = String(url.searchParams.get('workerId') || role).trim();
+    const doneId = String(url.searchParams.get('doneId') || '').trim();
+    const timeoutMs = Number(url.searchParams.get('timeoutMs')) || 55000;
+    try {
+      let abortWait = null;
+      req.on('close', () => { abortWait?.(); });
+      const outcome = await helpers.waitNext(role, {
+        workerId,
+        doneId,
+        timeoutMs,
+        onAbortRegistrar: (fn) => { abortWait = fn; },
+      });
+      if (res.writableEnded || res.destroyed) return true;
+      sendJson({
+        ok: true,
+        role,
+        enabled: helpers.isHelperEnabled(role),
+        timedOut: !!outcome.timedOut,
+        job: outcome.job ?? null,
+      });
+    } catch (err) {
+      sendJson({ ok: false, error: err?.message || String(err) }, 400);
+    }
+    return true;
+  }
+  if (helpers && req.method === 'POST' && pathname === '/api/agy/helper-done') {
+    const body = await readBody();
+    const id = String(body?.doneId || body?.id || '').trim();
+    if (!id) {
+      sendJson({ ok: false, error: '缺少任务 id' }, 400);
+      return true;
+    }
+    const ok = helpers.complete(id, body?.result ?? null);
+    log(`[helper] 任务完成确认: ${id} (matched=${ok})`);
+    sendJson({ ok: true, matched: ok });
+    return true;
+  }
+  if (helpers && req.method === 'POST' && pathname === '/api/agy/helper-submit') {
+    const body = await readBody();
+    const role = String(body?.role || '').trim().toLowerCase();
+    try {
+      if (!helpers.isHelperEnabled(role)) {
+        sendJson({ ok: false, disabled: true, role, error: `${role} 助手多线程已通过配置关闭` });
+        return true;
+      }
+      if (body?.requireOnline !== false && !helpers.isHelperOnline(role)) {
+        sendJson({ ok: false, offline: true, role, error: `${role} 助手线程当前未在线` });
+        return true;
+      }
+      const out = await helpers.enqueue(role, body?.payload ?? {}, {
+        waitResult: body?.waitResult === true,
+        timeoutMs: Number(body?.timeoutMs) || helpers.defaultTimeoutMs(role),
+      });
+      sendJson({ ...out, role });
+    } catch (err) {
+      sendJson({ ok: false, error: err?.message || String(err) }, 400);
+    }
     return true;
   }
   if (req.method === 'POST' && pathname === '/api/agy/judge-result') {

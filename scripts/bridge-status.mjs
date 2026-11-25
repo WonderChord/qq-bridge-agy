@@ -95,6 +95,27 @@ function classifyListener(cmd) {
       detail: '达到阈值后在本地触发分舱记忆归档',
     };
   }
+  if (/agy-wait-voice\.mjs/i.test(cmd)) {
+    return {
+      role: 'voice 语音导演精修线程',
+      key: 'voice',
+      detail: '异步打磨高表现力 Drama3 口语台本并选配情绪底音',
+    };
+  }
+  if (/agy-wait-search\.mjs/i.test(cmd)) {
+    return {
+      role: 'search 后台搜索查证线程',
+      key: 'search',
+      detail: '承担多源搜索核实与异步追评，保持主对话上下文干净',
+    };
+  }
+  if (/agy-wait-draw\.mjs/i.test(cmd)) {
+    return {
+      role: 'draw 绘图导演助手线程',
+      key: 'draw',
+      detail: '独立看参考图并精修生图 Prompt（物理隔离美术设定词）',
+    };
+  }
   return null;
 }
 
@@ -177,6 +198,12 @@ async function main() {
       console.log(`  - 最近一次群聊路由判定 : 模型=${d.model} (${d.endpoint}, ${d.latencyMs}ms) | should_reply=${d.should_reply} | 触发=${d.trigger} | 原因="${d.reason}"`);
     } else {
       console.log('  - 最近一次群聊路由判定 : 本次网桥启动后暂未触发群聊路由');
+    }
+    if (agyStatus.helpers) {
+      console.log(`\n[4] 协同助手多线程配置 (mode=${agyStatus.helpersMode || 'auto'}, enabled=${Boolean(agyStatus.helpersEnabled)})`);
+      for (const [role, h] of Object.entries(agyStatus.helpers)) {
+        console.log(`  - ${role.padEnd(6)} : 开关=${h.enabled ? 'ON ' : 'OFF'} | 在线=${h.online ? 'YES' : 'NO '} | 排队=${h.queued} | 已完成=${h.completed} | 超时=${h.timedOut}`);
+      }
     }
   }
 }

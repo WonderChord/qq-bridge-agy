@@ -22,7 +22,7 @@ Copy-Item .env.example .env
 
 在 `config.json` 填写 OneBot 的 WebSocket 与 HTTP 地址、令牌、`ownerQQ` 和需要响应的 `allow.private` 或 `allow.groups`。完成对应后端的设置后运行 `npm start`。控制台默认位于 `http://127.0.0.1:3100`，首次登录使用 `state/console-token` 里的令牌，手动配置了 `consoleToken` 时使用配置值。
 
-AGY 支持长期记忆分舱、表情、TTS 语音条、创作者生图和无头 NapCat 守护。DSH 路径沿用上游 v0.2.1-r1 的 preset 和协议适配，版本细节见 [DSH 0.2.1 适配记录](docs/guides/DSH_021_ADAPTATION.md)。
+AGY 支持长期记忆分舱、可配置的专业辅助多线程（语音导演 / 后台搜索 / 绘图导演，支持 `auto` 在线接管或 `off` 轻量直连）、表情、TTS 语音条、创作者生图和无头 NapCat 守护。DSH 路径沿用上游 v0.2.1-r1 的 preset 和协议适配，版本细节见 [DSH 0.2.1 适配记录](docs/guides/DSH_021_ADAPTATION.md)。
 
 [English](README.en.md) · [文档索引](docs/README.md) · [QQ 权限规则](RULES.md) · [语音与可选独立工具](docs/guides/QQ_VOICE.md)
 

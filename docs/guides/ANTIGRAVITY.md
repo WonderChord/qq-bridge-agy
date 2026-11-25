@@ -24,12 +24,32 @@
   - **引用自身本地秒判**：`resolveReplyInfo` / `isQuoteTargetSelf` 优先匹配当前会话内存 `recentMessages`，即便 OneBot `get_msg` 缓存过期，群友引用机器人刚发的表情或文字评价时也能 0ms 识别为直接对话。
   - **10 秒超时降级兜底**：外部路由异常或未配置密钥时，仅明确 `@自身QQ号` 或引用自身消息时降级放行，其余静默忽略并推进已读水位。
 
-### 2. 双线程分工与轮换机制
+### 2. 可配置的多线程分工与自动无损降级（`src/agy-helpers.js`）
 
-| 线程 | 模型建议 | 核心职责 | 强制换新上限 |
-|---|---|---|---|
-| `qq-chat-worker`（`w1`） | 主模型（`inherit` / `gpt-6-astra`） | 单线程串行承接已确认唤醒以维持 Prompt KV Cache；按会话 `seenSeq` 游标增量补齐群聊潜水上下文与跨会话文字锚点；单命令完成文字/批量回复/表情/语音/生图/标已读 | 日常 **30 轮**（沉浸扮演 **20 轮**；Codex 驱动默认 **80 轮**或 **320k token**） |
-| `qq-memory-archivist` | 主模型（`inherit`） | 旁路异步分舱长期记忆归纳（群聊满 150~200 条或私聊满 35~40 条触发，对话与记忆不出本机），支持 `event_book.md` 结构化沉淀 | **满 4 批强制换新清零上下文**（Codex 驱动采用单批独立 `--ephemeral` 线程） |
+通过 `config.json → socialV2.helpers` 或 `.env` 的 `AGY_HELPERS_MODE`（`auto` / `off`）及 `AGY_HELPER_VOICE` / `AGY_HELPER_SEARCH` / `AGY_HELPER_DRAW`，可自由选择**「完整五线程专业编队」**或**「轻量双线程直连」**：
+
+| 线程 | 模型建议 | 启用条件 | 核心职责 | 换新上限 |
+|---|---|---|---|---|
+| `qq-chat-worker`（`w1`） | 主模型（`inherit` / `gpt-6-astra`） | 必选 | 单线程串行承接已确认唤醒以维持 KV Cache；按会话 `seenSeq` 游标增量补齐上下文；单命令完成回复/表情/语音/生图/标已读 | 日常 **30 轮**（沉浸扮演 **20 轮**；Codex 默认 **80 轮**） |
+| `qq-voice-worker` | 主模型（`inherit`） | 可选（`helpers.voice`） | 异步接管 `send-tts` / `--voice-brief`，在独立上下文打磨 Drama 3 口语顿挫、气口标签与情绪底音，主线程秒回文字零阻塞 | **12 单** |
+| `qq-search-worker` | 轻量模型（`flash`） | 可选（`helpers.search`） | 接管 `agy-ask-search.mjs` 同步干货查证（返回 `<= 200` 字摘要）与 `--bg-search` 异步深查追评，防止长网页污染 `w1` 上下文 | **10 单** |
+| `qq-draw-worker` | 主模型（`inherit`） | 可选（`helpers.draw`） | 接管 `codex-draw` 画面导演，在独立美术上下文查看参考图并扩写生图 Prompt，物理隔离美术设定词防止串入日常聊天文本 | **8 单** |
+| `qq-memory-archivist` | 主模型（`inherit`） | 推荐 | 旁路异步分舱长期记忆归纳（群 150~200 条 / 私聊 35~40 条触发，支持 `event_book.md` 结构化沉淀） | **4 批**（Codex 采用单批 `--ephemeral`） |
+
+```json
+"helpers": {
+  "mode": "auto",
+  "voice": true,
+  "search": true,
+  "draw": true,
+  "voiceTimeoutMs": 45000,
+  "searchTimeoutMs": 36000,
+  "drawTimeoutMs": 75000
+}
+```
+
+- **`mode: "auto"`（默认，在线即接管、离线无损直连）**：只要拉起了 `agy-wait-voice.mjs` / `agy-wait-search.mjs` / `agy-wait-draw.mjs`，网桥自动将对应任务派发给专业子线程；若未拉起或子线程超时，自动回退主链路直连执行，绝不丢消息或卡住回合。
+- **`mode: "off"`（或 `.env` 设 `AGY_HELPERS_MODE=off` / 单项设 `false`）**：强制走轻量双线程直连模式（仅需 `w1` + `archivist`），即便有旧辅助监听进程连接也会自动提示退出且不派单；单轮临时跳过导演线程也可在 CLI 传 `--raw-tts` 或 `--direct-draw`。
 
 ---
 

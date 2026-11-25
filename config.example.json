@@ -314,6 +314,15 @@
       "google": {
         "lang": "zh-CN"
       }
+    },
+    "helpers": {
+      "mode": "auto",
+      "voice": true,
+      "search": true,
+      "draw": true,
+      "voiceTimeoutMs": 45000,
+      "searchTimeoutMs": 36000,
+      "drawTimeoutMs": 75000
     }
   },
   "webSearch": {

@@ -29,9 +29,13 @@ function parseArgs(argv) {
     image: null,
     tts: null,
     ttsList: [],
+    voiceBriefs: [],
+    rawTts: false,
     ttsProvider: null,
     ttsRef: null,
     codexDraws: [],
+    directDraw: false,
+    bgSearches: [],
     collectStickers: [],
     deprecateStickers: [],
     batch: null,
@@ -61,6 +65,16 @@ function parseArgs(argv) {
         opts.tts = tVal;
         opts.ttsList.push(tVal);
       }
+    }
+    else if ((a === '--voice-brief' || a === '--tts-brief') && i + 1 < argv.length) {
+      const bVal = String(argv[++i]).trim();
+      if (bVal) opts.voiceBriefs.push(bVal);
+    }
+    else if (a === '--raw-tts') opts.rawTts = true;
+    else if (a === '--direct-draw') opts.directDraw = true;
+    else if (a === '--bg-search' && i + 1 < argv.length) {
+      const sVal = String(argv[++i]).trim();
+      if (sVal) opts.bgSearches.push(sVal);
     }
     else if (a === '--tts-provider' && i + 1 < argv.length) opts.ttsProvider = String(argv[++i]).trim();
     else if (a === '--tts-ref' && i + 1 < argv.length) opts.ttsRef = String(argv[++i]).trim();
@@ -118,7 +132,9 @@ function parseArgs(argv) {
     opts.image = null;
     opts.tts = null;
     opts.ttsList = [];
+    opts.voiceBriefs = [];
     opts.codexDraws = [];
+    opts.bgSearches = [];
     opts.collectStickers = [];
   }
   return opts;
@@ -1176,19 +1192,82 @@ async function main() {
         console.error(`[agy-reply-and-wait] 图片发送警告: ${err?.message ?? err}`);
       }
     }
-    const rawTtsList = opts.ttsList.length > 0 ? opts.ttsList.map((x) => decodeOutboundTts(x)) : (opts.tts ? decodeOutboundTts(opts.tts) : []);
-    const allTtsSegments = expandTtsSegments(rawTtsList);
-    const lockedRef = inferUnifiedTtsRef(allTtsSegments, opts.ttsRef, opts.key);
-    for (let segIdx = 0; segIdx < allTtsSegments.length; segIdx += 1) {
-      const segText = allTtsSegments[segIdx];
-      const tp = { key: opts.key, text: String(segText), split: false, ttsRef: lockedRef, async: true };
+    const chineseCtxForVoice = opts.messages.map((m) => decodeOutboundText(m)).join(' ').slice(0, 480);
+    for (const briefText of opts.voiceBriefs) {
+      const tp = {
+        key: opts.key,
+        text: String(briefText),
+        voiceBrief: true,
+        split: true,
+        async: true,
+        chineseContext: chineseCtxForVoice,
+        situationMemo: String(opts.memo || ''),
+      };
+      if (opts.ttsRef) tp.ttsRef = String(opts.ttsRef);
       if (opts.ttsProvider) tp.provider = String(opts.ttsProvider);
-      if (opts.finishTurn && segIdx === 0) tp.turn = opts.finishTurn;
+      if (opts.finishTurn) tp.turn = opts.finishTurn;
+      try {
+        await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
+      } catch (err) {
+        failed = true;
+        console.error(`[agy-reply-and-wait] 语音意图提交警告: ${err?.message ?? err}`);
+      }
+    }
+    const rawTtsList = opts.ttsList.length > 0 ? opts.ttsList.map((x) => decodeOutboundTts(x)) : (opts.tts ? [decodeOutboundTts(opts.tts)] : []);
+    if (rawTtsList.length > 0 && !opts.rawTts) {
+      // 整段交给网桥（若配置启用且 qq-voice-worker 在线则整段精修切分并选底音；否则由网桥自动切分直连合成）
+      const joinedRaw = rawTtsList.join(' ').trim();
+      const lockedRef = inferUnifiedTtsRef(rawTtsList, opts.ttsRef, opts.key);
+      const tp = {
+        key: opts.key,
+        text: joinedRaw,
+        split: true,
+        ttsRef: lockedRef,
+        async: true,
+        chineseContext: chineseCtxForVoice,
+        situationMemo: String(opts.memo || ''),
+      };
+      if (opts.ttsProvider) tp.provider = String(opts.ttsProvider);
+      if (opts.finishTurn) tp.turn = opts.finishTurn;
       try {
         await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
       } catch (err) {
         failed = true;
         console.error(`[agy-reply-and-wait] TTS 语音发送警告: ${err?.message ?? err}`);
+      }
+    } else {
+      const allTtsSegments = expandTtsSegments(rawTtsList);
+      const lockedRef = inferUnifiedTtsRef(allTtsSegments, opts.ttsRef, opts.key);
+      for (let segIdx = 0; segIdx < allTtsSegments.length; segIdx += 1) {
+        const segText = allTtsSegments[segIdx];
+        const tp = { key: opts.key, text: String(segText), split: false, ttsRef: lockedRef, async: true, direct: true };
+        if (opts.ttsProvider) tp.provider = String(opts.ttsProvider);
+        if (opts.finishTurn && segIdx === 0) tp.turn = opts.finishTurn;
+        try {
+          await postBridge(port, consoleToken, opts.token, '/api/socialV2/send-tts', tp);
+        } catch (err) {
+          failed = true;
+          console.error(`[agy-reply-and-wait] TTS 语音发送警告: ${err?.message ?? err}`);
+        }
+      }
+    }
+    for (const bgQuery of opts.bgSearches) {
+      try {
+        await postBridge(port, consoleToken, '', '/api/agy/helper-submit', {
+          role: 'search',
+          requireOnline: true,
+          waitResult: false,
+          payload: {
+            mode: 'followup',
+            key: opts.key,
+            token: opts.token,
+            replyToMessageId: opts.reply ? String(opts.reply) : undefined,
+            query: bgQuery,
+            chineseReply: chineseCtxForVoice,
+          },
+        });
+      } catch (err) {
+        console.error(`[agy-reply-and-wait] 后台搜索追评提交提示: ${err?.message ?? err}`);
       }
     }
     for (const rawDraw of opts.codexDraws) {
@@ -1228,6 +1307,7 @@ async function main() {
         turn: opts.finishTurn || undefined,
         prompt: String(spec.prompt || '').trim(),
         selfRef: typeof spec.selfRef === 'boolean' ? spec.selfRef : true,
+        ...(opts.directDraw || spec.direct === true ? { direct: true } : {}),
         ...(spec.refMsgId != null ? { refMsgId: String(spec.refMsgId) } : {}),
         ...(spec.asSticker === true ? { asSticker: true } : {}),
         ...(spec.note ? { note: String(spec.note) } : {}),
