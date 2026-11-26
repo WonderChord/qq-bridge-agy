@@ -32,6 +32,7 @@ import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import { splitDrama3TextForTts } from '../src/tts.js';
+import { detectNsfwIntent } from './agy-codex-draw.mjs';
 import { AgyApiClient, unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -203,7 +204,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
           ? new AgyApiClient(baseUrl, path.join(temp, 'state/agy-worker-turns.json')) : api;
       }
     },
-    SnowLumaWebSocketClient: FakeBot, text: (s) => s, splitDrama3TextForTts,
+    SnowLumaWebSocketClient: FakeBot, text: (s) => s, splitDrama3TextForTts, detectNsfwIntent,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
     ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...roleCard,

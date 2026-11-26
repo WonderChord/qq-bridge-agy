@@ -155,7 +155,7 @@ export async function handleAgyRequest({
       sendJson({ ok: false, error: '会话令牌无效或当前不接受回复' }, 403);
       return true;
     }
-    const result = api.claimTurn(turn, state.sessions[key], workerId);
+    const result = api.claimTurn(turn, state.sessions[key], workerId, key);
     if (result === 'stale') { sendJson({ ok: false, error: '该回合已过期或属于其他 Worker' }, 409); return true; }
     sendJson({ ok: true, duplicate: result === 'duplicate' });
     return true;

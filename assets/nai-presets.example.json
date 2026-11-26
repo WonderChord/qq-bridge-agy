@@ -1,0 +1,55 @@
+{
+  "default_preset": "pop_cel",
+  "default_preset_sticker": "chibi_sticker",
+  "default_preset_general": "graphic_sketch",
+  "default_ref": "assets/self-ref.png",
+  "private_ref": "assets/self-private-ref.png",
+  "char_sfw": "1girl, short dark hair, blue eyes, cheerful expression",
+  "char_priv_sfw": "1girl, short dark hair, blue eyes, indoors, relaxed loungewear",
+  "char_nsfw": "1girl, short dark hair, blue eyes, alluring expression",
+  "char_neg_sfw": "lowres, bad anatomy, bad hands, extra digits, missing fingers",
+  "char_neg_nsfw": "lowres, bad anatomy, bad hands, extra digits, missing fingers, grotesque",
+  "global_neg_sfw": "lowres, artistic error, scan artifacts, worst quality, bad quality, jpeg artifacts, watermark, text, signature",
+  "global_neg_nsfw": "lowres, artistic error, worst quality, bad quality, jpeg artifacts, watermark, text, signature, deformed anatomy",
+  "presets": {
+    "pop_cel": {
+      "label": "清爽描边赛璐璐（通用默认）",
+      "for_self": true,
+      "model": "nai-diffusion-5-full",
+      "artist_string": "anime coloring, crisp lineart, vibrant lighting",
+      "scale": 5.0,
+      "cfg_rescale": 0.16,
+      "ref_strength": 0.76,
+      "nsfw_ref_strength": 0.70
+    },
+    "velvet_dusk": {
+      "label": "暮色柔焦薄涂（日常/私密氛围通用）",
+      "for_self": true,
+      "model": "nai-diffusion-5-full",
+      "artist_string": "soft watercolor lighting, warm dusk glow, depth of field, atmospheric haze",
+      "scale": 5.0,
+      "cfg_rescale": 0.16,
+      "ref_strength": 0.76,
+      "nsfw_ref_strength": 0.70,
+      "allow_sweat": true
+    },
+    "chibi_sticker": {
+      "label": "Q版大头表情包贴纸",
+      "for_self": true,
+      "is_chibi": true,
+      "model": "nai-diffusion-5-full",
+      "artist_string": "chibi, super deformed, sticker, thick outline, white border, simple background",
+      "scale": 5.0,
+      "cfg_rescale": 0.16,
+      "ref_strength": 0.55
+    },
+    "graphic_sketch": {
+      "label": "通用插画速写（非自画像）",
+      "for_self": false,
+      "model": "nai-diffusion-5-full",
+      "artist_string": "illustration, clean composition, cinematic lighting",
+      "scale": 5.0,
+      "cfg_rescale": 0.16
+    }
+  }
+}

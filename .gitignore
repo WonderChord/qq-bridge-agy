@@ -78,4 +78,5 @@ memory/*
 stickers/*
 !stickers/README.md
 assets/self*.png
+assets/nai-presets.json
 bin/*.exe

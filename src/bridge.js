@@ -65,7 +65,7 @@ import {
 import { synthesizeSpeech, splitDrama3TextForTts } from './tts.js';
 import { recoverNapcatLogin, loginAttemptFile } from './napcat-login.js';
 import { napcatLoginConfig } from './napcat-config.js';
-import { runCodexDraw } from '../scripts/agy-codex-draw.mjs';
+import { runCodexDraw, detectNsfwIntent } from '../scripts/agy-codex-draw.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -5450,7 +5450,7 @@ async function main() {
           // 如果当前已经是“潜水”唤醒配置，且最近还有对话/刚被唤醒，不允许用 mark_read 直接回到潜水；
           // 必须先等够沉睡前观察窗口，避免“聊两句又去潜水”。
           const workerAck = api.isAgyBackend && body.turn && throughSeq != null
-            && api.isTurnActive(body.turn, state.sessions[key] || null);
+            && api.isTurnActive(body.turn, state.sessions[key] || null, key);
           if (api.isAgyBackend && body.turn && !workerAck) {
             sendJson({ ok: false, error: '回合已结束或会话不匹配，请使用本次唤醒的水位与回合 ID' }, 409);
             return;
@@ -6200,6 +6200,13 @@ async function main() {
           if (req.headers['x-agent-token'] && !v2ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
           try {
             const entry = await getStickerImageData(stickerId);
+            const isOutsourcedSticker = /^codex_/i.test(String(entry?.name || ''))
+              || /[\\/]codex_[0-9a-f]+\./i.test(String(entry?.file || entry?.url || ''))
+              || (Array.isArray(entry?.tags) && entry.tags.includes('外包'));
+            if (req.headers['x-agent-token'] && isOutsourcedSticker) {
+              sendJson({ ok: false, blockedGenerated: true, error: '该表情为外包生成的定制画作，按规程不回读生成图' }, 403);
+              return;
+            }
             const fetched = await readStickerEntryBuffer(entry);
             const dims = getImageDimensions(fetched.buffer);
             if (dims && dims.width * dims.height > MAX_MEDIA_PIXELS) {
@@ -6935,7 +6942,7 @@ async function main() {
           }
           // Creator 专属额度闸门：仅 Creator 私聊，或群聊内明确响应 Creator 指令时放行
           const now = Date.now();
-          if (body.turn && api.isAgyBackend && !api.isTurnActive(body.turn, state.sessions[key] || null)) {
+          if (body.turn && api.isAgyBackend && !api.isTurnActive(body.turn, state.sessions[key] || null, key)) {
             sendJson({ ok: false, error: '生图请求的唤醒回合已过期' }, 409);
             return;
           }
@@ -6978,9 +6985,19 @@ async function main() {
                 const refMsg = [...(st.recentMessages || [])].reverse().find(
                   (m) => m && (String(m.messageId ?? '') === refMsgId || String(m.seq ?? '') === refMsgId)
                 );
-                const mediaList = Array.isArray(refMsg?.media) ? refMsg.media.filter((x) => x?.kind === 'image').slice(0, 3) : [];
+                const isSelfGeneratedRef = Boolean(
+                  refMsg && (
+                    refMsg.isSelf
+                    || refMsg.generatedByDraw
+                    || refMsg.sender === '我'
+                    || /^\[外包(?:画作|表情包)已送达/.test(String(refMsg.text || refMsg.plain || ''))
+                  )
+                );
+                const mediaList = (!isSelfGeneratedRef && Array.isArray(refMsg?.media))
+                  ? refMsg.media.filter((x) => x?.kind === 'image').slice(0, 3)
+                  : [];
                 if (mediaList.length > 0) {
-                  const refDir = path.join(DRAWN_DIR, 'refs');
+                  const refDir = path.join(STATE_DIR, 'media_refs');
                   fs.mkdirSync(refDir, { recursive: true });
                   for (let idx = 0; idx < mediaList.length; idx += 1) {
                     const fetchedImg = await fetchOneBotImage(mediaList[idx]);
@@ -6995,7 +7012,14 @@ async function main() {
               }
               let effectivePrompt = prompt;
               let effectiveSelfRef = selfRef;
+              let effectivePreset = typeof body.preset === 'string' ? body.preset.trim() : '';
+              let effectiveNsfw = typeof body.nsfw === 'boolean' ? body.nsfw : undefined;
+              let effectivePrivateRef = Boolean(body.privateRef);
+              let effectiveProvider = typeof body.provider === 'string' ? body.provider.trim().toLowerCase() : '';
+              const isNsfwDraw = detectNsfwIntent(prompt, effectiveNsfw);
+              if (isNsfwDraw && effectiveNsfw === undefined) effectiveNsfw = true;
               if (body.direct !== true && helpers.canDispatch('draw')) {
+                const drawWaitMs = isNsfwDraw ? Math.min(helpers.defaultTimeoutMs('draw'), 35000) : helpers.defaultTimeoutMs('draw');
                 const polishOut = await helpers.enqueue('draw', {
                   jobId,
                   key,
@@ -7008,19 +7032,30 @@ async function main() {
                   recentContext: (st.recentMessages || [])
                     .slice(-4)
                     .map((m) => `${m.sender}: ${String(m.plain || m.text || '').slice(0, 140)}`),
-                }, { waitResult: true, timeoutMs: helpers.defaultTimeoutMs('draw') });
-                if (polishOut?.completed && polishOut.result?.prompt) {
+                }, { waitResult: true, timeoutMs: drawWaitMs });
+                if (polishOut?.completed && polishOut.result?.fallback) {
+                  log(`[codex-draw] AGY 绘图助手移交生图分镜管线直出 (${jobId})`);
+                } else if (polishOut?.completed && polishOut.result?.prompt) {
                   effectivePrompt = String(polishOut.result.prompt).trim().slice(0, 2500) || prompt;
                   if (typeof polishOut.result.selfRef === 'boolean') effectiveSelfRef = polishOut.result.selfRef;
-                  log(`[codex-draw] 绘图助手已完成画面导演精修 ${jobId} (${effectivePrompt.length} 字, selfRef=${effectiveSelfRef})`);
+                  if (polishOut.result.preset) effectivePreset = String(polishOut.result.preset).trim();
+                  if (typeof polishOut.result.nsfw === 'boolean') effectiveNsfw = polishOut.result.nsfw;
+                  if (typeof polishOut.result.privateRef === 'boolean') effectivePrivateRef = Boolean(polishOut.result.privateRef);
+                  if (polishOut.result.provider) effectiveProvider = String(polishOut.result.provider).trim().toLowerCase();
+                  log(`[codex-draw] AGY 绘图助手已完成画面导演精修 ${jobId} (${effectivePrompt.length} 字, selfRef=${effectiveSelfRef}, preset=${effectivePreset || 'auto'}, nsfw=${Boolean(effectiveNsfw)})`);
                 } else {
-                  log(`[codex-draw] 绘图助手超时或跳过 (${jobId})，回退原描述直接生图`);
+                  log(`[codex-draw] AGY 绘图助手超时或未接单 (${jobId})，交由生图分镜管线扩写生图`);
                 }
               }
               const outFile = path.join(DRAWN_DIR, `${jobId}.png`);
               const drawRes = await runCodexDraw({
                 prompt: effectivePrompt,
                 selfRef: effectiveSelfRef,
+                asSticker,
+                preset: effectivePreset,
+                nsfw: effectiveNsfw,
+                privateRef: effectivePrivateRef,
+                provider: effectiveProvider,
                 refs: tempRefFiles,
                 out: outFile,
                 timeoutSec: 240
@@ -7046,6 +7081,7 @@ async function main() {
                   isOwner: true,
                   ownerLabel: '我',
                   isSelf: true,
+                  generatedByDraw: true,
                   media: [],
                   hasMedia: false,
                   forwardIds: [],
@@ -7066,6 +7102,7 @@ async function main() {
                   isOwner: true,
                   ownerLabel: '我',
                   isSelf: true,
+                  generatedByDraw: true,
                   media: [],
                   hasMedia: false,
                   forwardIds: [],
@@ -8284,6 +8321,28 @@ async function main() {
             sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
             return;
           }
+          if (socialV2.conversations.has(key) || currentMode === 'reserved2') {
+            const stImg = getSocialV2State(key);
+            const matchedMsg = [...(stImg?.recentMessages || []), ...(stImg?.unread || [])].find(
+              (m) => m && (String(m.messageId ?? '') === messageId || String(m.seq ?? '') === messageId)
+            );
+            if (matchedMsg && (
+              matchedMsg.isSelf
+              || matchedMsg.generatedByDraw
+              || matchedMsg.sender === '我'
+              || /^\[外包(?:画作|表情包)已送达/.test(String(matchedMsg.text || matchedMsg.plain || ''))
+            )) {
+              sendJson({
+                ok: true,
+                messageId,
+                media: [],
+                images: [],
+                blockedGenerated: true,
+                note: '该消息是机器人自身送达的画作或自发图片，按规程不回读生成图'
+              });
+              return;
+            }
+          }
           const media = findMessageMedia(key, messageId);
           if (!media.length) {
             sendJson({ ok: true, messageId, media: [], images: [], note: '该消息没有可读取的图片/表情元数据' });
@@ -8564,6 +8623,7 @@ async function main() {
             // 而重启这条路径以前直接 process.exit，500ms 窗口内改动的唤醒配置/计数器会丢。
             try { saveState(); } catch (error) { log('重启前保存会话映射失败:', error?.message ?? error); }
             try { saveSocialV2State(); } catch (error) { log('重启前保存二代会话状态失败:', error?.message ?? error); }
+            try { server.closeAllConnections?.(); server.close(); } catch {}
             releaseLock();
             process.exit(0);
           }, 500);
@@ -8576,18 +8636,29 @@ async function main() {
       }
     });
     server.once('close', memory.close);
-    server.listen(port, '127.0.0.1', () => {
-      log(`本地控制台已启动：http://127.0.0.1:${port}`);
-    });
-    // 端口被占用说明已有实例在跑：以 exit 2 退出，守护脚本会识别为"已有实例"而不是无限重启
+    let bindAttempts = 0;
+    const tryListen = () => {
+      bindAttempts += 1;
+      server.listen(port, '127.0.0.1', () => {
+        log(`本地控制台已启动：http://127.0.0.1:${port}`);
+      });
+    };
+    // Windows 下旧实例刚退出而长轮询句柄尚未完全释放时，立刻监听会瞬时报 EACCES/EADDRINUSE；已持锁时自动重试防假死离线
     server.on('error', (error) => {
+      if ((error?.code === 'EACCES' || error?.code === 'EADDRINUSE') && bindAttempts < 12) {
+        log(`控制台端口 ${port} 正在等待旧套接字释放 (${error.code}, 第 ${bindAttempts}/12 次重试)…`);
+        setTimeout(tryListen, 350);
+        return;
+      }
       log(`控制台服务错误: ${error?.message ?? error}`);
+      releaseLock();
       if (error?.code === 'EADDRINUSE') {
         console.error(`[bridge] 控制台端口 ${port} 已被占用（可能已有实例在运行），退出。`);
         process.exit(2);
       }
       process.exit(1);
     });
+    tryListen();
     return server;
   }
 
@@ -12228,7 +12299,10 @@ async function main() {
       st.sleepTimer = null;
     }
     st.pendingWakeReason = reason;
-    const configuredBatchMs = Math.max(200, Number(st.wakeConfig?.batchWindowMs) || 1200);
+    const isOwnerPriv = String(key).startsWith('private:') && CREATOR_UIDS.has(String(key).slice(8));
+    const configuredBatchMs = isOwnerPriv
+      ? Math.min(600, Math.max(200, Number(st.wakeConfig?.batchWindowMs) || 600))
+      : Math.max(200, Number(st.wakeConfig?.batchWindowMs) || 1200);
     const batchMs = immediate ? 120 : configuredBatchMs;
     st.pendingWakeTimer = setTimeout(() => {
       st.pendingWakeTimer = null;
@@ -12284,10 +12358,19 @@ async function main() {
   if (api?.isAgyBackend) {
     const allowedWorkersCfg = cfg.socialV2?.wake?.allowedWorkers;
     api.setAllowedWorkers?.(Array.isArray(allowedWorkersCfg) && allowedWorkersCfg.length > 0 ? allowedWorkersCfg : ['w1', 'w2']);
-    api.onWorkerAvailable = () => {
+    api.onWorkerAvailable = (completedSid) => {
       for (const [k, st] of socialV2.conversations.entries()) {
         if (Array.isArray(st?.pendingWakeReasons) && st.pendingWakeReasons.length > 0 && !isConversationBusyV2(k, st)) {
           replayPendingWakeReasonsV2(k, { immediate: true });
+          continue;
+        }
+        // 网桥重启后新监听连入且管理员私聊存在新于上次唤醒的未读消息（例如重启打断了待发唤醒定时器）时，立即补唤醒
+        if (completedSid == null && String(k).startsWith('private:') && CREATOR_UIDS.has(k.slice(8))
+            && Array.isArray(st?.unread) && st.unread.length > 0
+            && Number(st.lastIncomingAt || 0) > Number(st.wakeConfig?.lastWakeAt || 0)
+            && !st.pendingWakeTimer && !isConversationBusyV2(k, st)
+            && !api.hasActiveTurnForKey?.(k)) {
+          scheduleWakeV2(k, 'private', { immediate: true });
         }
       }
     };
@@ -13661,7 +13744,67 @@ async function main() {
         selfDisplayName = String(login.nickname).trim();
         log(`机器人昵称: ${login.nickname}`);
       }
-      if (login?.user_id != null) selfUserId = String(login.user_id);
+      if (login?.user_id != null) {
+        selfUserId = String(login.user_id);
+        // 网桥重启或 WS 闪断重连后，自动回溯管理员私聊最近历史，捞回断连窗口内漏收的消息
+        void (async () => {
+          const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+          const headers = { 'content-type': 'application/json' };
+          if (cfg.snowluma?.accessToken) headers.authorization = `Bearer ${cfg.snowluma.accessToken}`;
+          const nowSec = Math.floor(Date.now() / 1000);
+          const ownerList = getRouterConfig().ownerIds || [];
+          for (const uid of ownerList) {
+            try {
+              const r = await fetch(`${httpUrl}/get_friend_msg_history`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({ user_id: Number(uid), count: 6 }),
+                signal: AbortSignal.timeout(5000),
+              });
+              const d = await r.json().catch(() => null);
+              const hist = Array.isArray(d?.data?.messages) ? d.data.messages : [];
+              if (!hist.length) continue;
+              let lastSelfIdx = -1;
+              for (let i = 0; i < hist.length; i += 1) {
+                const senderUid = String(hist[i]?.sender?.user_id ?? hist[i]?.user_id ?? '');
+                if (senderUid === selfUserId) lastSelfIdx = i;
+              }
+              const candidates = hist.slice(lastSelfIdx + 1).filter((m) => {
+                const senderUid = String(m?.sender?.user_id ?? m?.user_id ?? '');
+                return senderUid === String(uid) && m?.message_id != null && (nowSec - Number(m?.time || 0)) <= 2700;
+              });
+              if (!candidates.length) continue;
+              const key = `private:${uid}`;
+              const st = getSocialV2State(key);
+              const knownIds = new Set([
+                ...(st?.recentMessages || []).map((x) => String(x?.messageId ?? '')),
+                ...(st?.unread || []).map((x) => String(x?.messageId ?? '')),
+              ]);
+              const missed = [];
+              for (const m of candidates) {
+                if (knownIds.has(String(m.message_id))) continue;
+                const rawTxt = String(m.raw_message || '').trim();
+                if (rawTxt && missed.length > 0 && String(missed[missed.length - 1].raw_message || '').trim() === rawTxt) {
+                  missed[missed.length - 1] = m;
+                } else {
+                  missed.push(m);
+                }
+              }
+              for (const m of missed) {
+                log(`[reserved2] 捞回重启/断连窗口漏收的私聊消息 ${key} msgId=${m.message_id}: ${String(m.raw_message || '').slice(0, 60)}`);
+                await handleIncoming('private', Number(uid), {
+                  ...m,
+                  post_type: 'message',
+                  message_type: 'private',
+                  sub_type: m.sub_type || 'friend',
+                  self_id: Number(selfUserId),
+                  user_id: Number(uid),
+                }, cfg);
+              }
+            } catch {}
+          }
+        })();
+      }
     }).catch(() => {});
     // 连接成功后顺手确认一下 token 是否已跟当前账号对齐；不一致就写回 config.json，
     // 让 MCP 工具（另一个进程）也能拿到正确的 token。

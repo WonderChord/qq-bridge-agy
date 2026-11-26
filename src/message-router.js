@@ -290,6 +290,17 @@ export async function classifyGroupMessageWithRouter({
   fetchImpl = globalThis.fetch,
 } = {}) {
   const t0 = Date.now();
+  if ((explicitAtSelf || quoteTargetIsSelf) && !/\[当前待判定消息\][^\r\n]*(?:不用回|别回|勿回)/.test(String(routerInput || ''))) {
+    return {
+      ok: true,
+      degraded: false,
+      should_reply: true,
+      reason: explicitAtSelf ? '明确@助手本地零延迟直通' : '引用助手消息本地零延迟直通',
+      model: 'local-fastpath',
+      endpoint: 'fastpath',
+      latencyMs: 0,
+    };
+  }
   const model = routerCfg?.model || DEFAULT_ROUTER_MODEL;
   const baseUrl = normalizeOpenAiBaseUrl(routerCfg?.baseUrl || DEFAULT_OPENAI_BASE_URL);
   const timeoutMs = Number(routerCfg?.timeoutMs) || DEFAULT_ROUTER_TIMEOUT_MS;

@@ -21,7 +21,7 @@ export function createTurnClaims(api, getSessionId) {
   function checkTurnActionV2(key, turnRaw, actionSig) {
     const turn = String(turnRaw ?? '').trim();
     if (!turn) return null;
-    if (api.isAgyBackend && !api.isTurnActive(turn, getSessionId(key) || null)) {
+    if (api.isAgyBackend && !api.isTurnActive(turn, getSessionId(key) || null, key)) {
       return `唤醒回合 ${turn} 已完结，拦截重复重放`;
     }
     const now = Date.now();

@@ -109,12 +109,12 @@ export function guardWakeStdoutAgainstTruncation(wid, key, cursor, prefixText, t
     prefix = prefix.replace(/^\s+/, '');
   }
   const combined = prefix + tailText;
-  if (process.env.QQ_BRIDGE_HOST === 'codex' || Buffer.byteLength(combined, 'utf8') <= 8200) {
+  if (process.env.QQ_BRIDGE_HOST === 'codex' || Buffer.byteLength(combined, 'utf8') <= 9200) {
     return combined;
   }
   const timeIdx = prefix.indexOf('【当前时间】');
   if (timeIdx >= 0) {
-    const stillTooLong = Buffer.byteLength(prefix.slice(timeIdx) + tailText, 'utf8') > 7800;
+    const stillTooLong = Buffer.byteLength(prefix.slice(timeIdx) + tailText, 'utf8') > 8600;
     const recallIdx = prefix.search(/【(?:Creator 详细事件簿按需巡回|私聊历史日记按需巡回|本轮视情况巡回挂载的深度详档)/);
     if (timeIdx > 200 || (stillTooLong && recallIdx > 0)) {
       const heavyParts = [];
@@ -123,7 +123,7 @@ export function guardWakeStdoutAgainstTruncation(wid, key, cursor, prefixText, t
         heavyParts.push(prefix.slice(0, timeIdx).trim());
         restPrefix = prefix.slice(timeIdx);
       }
-      if (Buffer.byteLength(restPrefix + tailText, 'utf8') > 7800) {
+      if (Buffer.byteLength(restPrefix + tailText, 'utf8') > 8600) {
         const rIdx = restPrefix.search(/【(?:Creator 详细事件簿按需巡回|私聊历史日记按需巡回|本轮视情况巡回挂载的深度详档)/);
         if (rIdx > 0) {
           heavyParts.push(restPrefix.slice(rIdx).trim());
@@ -136,10 +136,10 @@ export function guardWakeStdoutAgainstTruncation(wid, key, cursor, prefixText, t
         fs.mkdirSync(path.dirname(spillFile), { recursive: true });
         fs.writeFileSync(spillFile, heavyHeader + '\n', 'utf8');
         const spillPosix = spillFile.replace(/\\/g, '/');
-        const needMustRead = /【角色卡已热更新|【本群日常常驻记忆|【本会话分舱|【本会话专属|【本轮视情况巡回/.test(heavyHeader);
-        const notice = (!needMustRead && String(key || '').startsWith('private:'))
-          ? `【附加巡回与表情库已落盘备查："${spillPosix}"（需查往事/表情时可 view_file 读取，否则直接回复下方快照）】\n\n`
-          : `【群记忆与附加详情已完整落盘（防终端 10KB 截断）】请先调 1 次 view_file 读取 "${spillPosix}"，再回复下方消息快照！\n\n`;
+        const needMustRead = /【角色卡已热更新|【本群日常常驻记忆|【本会话分舱长期记忆|【本会话专属/.test(heavyHeader);
+        const notice = needMustRead
+          ? `【首次常驻记忆已完整落盘（防终端 10KB 截断）】请先调 1 次 view_file 读取 "${spillPosix}"，再回复下方消息快照！\n\n`
+          : `【附加历史巡回与表情详档已落盘备查："${spillPosix}"（日常接话无需读取，请直接秒回下方快照；仅追问冷门往事细节时按需读取）】\n\n`;
         return notice + restPrefix + tailText;
       } catch {}
     }

@@ -46,7 +46,20 @@ async function main() {
     for (let i = 0; i < 25; i++) {
       await sleep(200);
       const current = await queryStatus();
-      if (!current || current.pid !== pid) { console.log('已停止 qq-bridge'); return; }
+      if (!current || current.pid !== pid) {
+        // 确保旧进程 PID 与内核套接字完全退出后再返回，防止紧接着 start 撞上 Windows 端口 EACCES
+        for (let k = 0; k < 15; k++) {
+          try {
+            process.kill(pid, 0);
+            await sleep(150);
+          } catch (e) {
+            if (e?.code === 'ESRCH') break;
+            await sleep(150);
+          }
+        }
+        console.log('已停止 qq-bridge');
+        return;
+      }
     }
     throw new Error('停止请求已接受，等待实例退出超时');
   }

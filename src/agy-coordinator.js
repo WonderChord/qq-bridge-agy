@@ -6,6 +6,11 @@ import { buildRouterInput, classifyGroupMessageWithRouter, DEFAULT_ROUTER_MODEL 
 
 const AGY_WORKER_TURNS_FILE = fileURLToPath(new URL('../state/agy-worker-turns.json', import.meta.url));
 
+function extractConvKey(text) {
+  const m = /(?:private|group):\d+/.exec(String(text || ''));
+  return m ? m[0] : '';
+}
+
 /** 从 assistant 消息的 ContentBlock[] 中提取纯文本。 */
 export function blocksToText(content) {
   return (content ?? [])
@@ -32,7 +37,9 @@ export class AgyApiClient {
     this._sessionEventTurn = new Map();
     this._workerTurns = new Map(); // workerId -> deliveredTurns
     this._allowedWorkers = new Set(['primary', 'w1', 'w2']);
+    this._activeTurnsFile = path.join(path.dirname(this._turnsFile), 'agy-active-turns.json');
     this._loadWorkerTurns();
+    this._loadActiveTurns();
     this.onWorkerAvailable = null;
     this.onWorkerRotated = null;
     this._pruneTimer = setInterval(() => {
@@ -94,21 +101,23 @@ export class AgyApiClient {
           });
           return ok({});
         }
+        const text = blocksToText(content);
+        const imageCount = (content ?? []).filter((b) => b?.type === 'image').length;
+        const convKey = extractConvKey(text);
         const hadActive = this.activeTurnCount(sessionId) > 0;
         const wakeId = randomUUID();
-        const turnEntry = { sessionId, turn, wakeId, workerId: '', startedAt: Date.now() };
+        const turnEntry = { sessionId, key: convKey, turn, wakeId, workerId: '', startedAt: Date.now() };
         this._activeTurns.set(turn, turnEntry);
         if (!hadActive) {
           this._sessionEventTurn.set(sessionId, turn);
           this._emitSessionEvent(sessionId, { type: 'turn/start', data: { turn } });
         }
 
-        const text = blocksToText(content);
-        const imageCount = (content ?? []).filter((b) => b?.type === 'image').length;
         const item = {
           wakeId,
           turn,
           sessionId,
+          key: convKey,
           text,
           imageCount,
           createdAt: new Date().toISOString(),
@@ -120,6 +129,7 @@ export class AgyApiClient {
           bestWaiter.deliver(item);
         } else {
           this._enqueueWake(item);
+          this._saveActiveTurns();
         }
         return ok({ turn });
       },
@@ -220,7 +230,7 @@ export class AgyApiClient {
               turn: nextTurn,
               requeuedCount: (Number(snapshot.requeuedCount) || 0) + 1,
             };
-            const next = { turn: nextTurn, sessionId: info.sessionId, wakeId: item.wakeId, workerId: '', startedAt: now };
+            const next = { turn: nextTurn, sessionId: info.sessionId, key: info.key || '', wakeId: item.wakeId, workerId: '', startedAt: now };
             this._completedTurns.set(t, now);
             this._activeTurns.delete(t);
             this._activeTurns.set(nextTurn, next);
@@ -233,6 +243,9 @@ export class AgyApiClient {
         this._completedTurns.set(t, now);
         expiredSids.set(info.sessionId, t);
       }
+    }
+    if (expiredSids.size > 0 || recoveredItems.length > 0) {
+      this._saveActiveTurns();
     }
     for (const [turn, at] of this._completedTurns) {
       if (now - at > 7_200_000) this._completedTurns.delete(turn);
@@ -258,14 +271,17 @@ export class AgyApiClient {
     const active = this._activeTurns.get(item.turn);
     active.workerId = workerId;
     active.startedAt = now;
-    this._workerHealth.get(workerId).lastWakeAt = new Date(now).toISOString();
+    const h = this._workerHealth.get(workerId);
+    if (h) h.lastWakeAt = new Date(now).toISOString();
     item.workerTurnIndex = (this._workerTurns.get(workerId) || 0) + 1;
     this._workerTurns.set(workerId, item.workerTurnIndex);
     this._saveWorkerTurns();
+    this._saveActiveTurns();
   }
 
   _recoverSilentTurns(workerId, finish) {
     const retry = [];
+    const now = Date.now();
     for (const old of [...this._activeTurns.values()]) {
       if (old.workerId !== workerId || finish?.all || finish?.turn === old.turn
           || (!finish?.turn && !finish?.workerId && finish?.sessionId === old.sessionId)) continue;
@@ -279,21 +295,23 @@ export class AgyApiClient {
         this.completeTurn({ turn: old.turn });
         continue;
       }
-      const now = Date.now();
       const item = {
         ...snapshot,
         wakeId: randomUUID(),
         turn,
         requeuedCount: (Number(snapshot.requeuedCount) || 0) + 1,
       };
-      const next = { turn, sessionId: old.sessionId, wakeId: item.wakeId, workerId: '', startedAt: now };
+      const next = { turn, sessionId: old.sessionId, key: old.key || '', wakeId: item.wakeId, workerId: '', startedAt: now };
       this._completedTurns.set(old.turn, now);
       this._activeTurns.delete(old.turn);
       this._activeTurns.set(turn, next);
       this._snapshots.set(next, item);
       retry.push(item);
     }
-    this._wakeQueue.unshift(...retry);
+    if (retry.length > 0) {
+      this._wakeQueue.unshift(...retry);
+      this._saveActiveTurns();
+    }
     return retry.length;
   }
 
@@ -385,20 +403,37 @@ export class AgyApiClient {
     return best;
   }
 
-  activeTurnCount(sessionId) {
+  activeTurnCount(sessionId, key = '') {
     this._pruneStaleTurns();
-    if (!sessionId) return this._activeTurns.size;
+    if (!sessionId && !key) return this._activeTurns.size;
     let n = 0;
     for (const info of this._activeTurns.values()) {
-      if (info.sessionId === sessionId) n += 1;
+      if ((sessionId && info.sessionId === sessionId) || (key && info.key === key)) n += 1;
     }
     return n;
   }
 
-  isTurnActive(turn, sessionId) {
+  isTurnActive(turn, sessionId, key = '') {
     this._pruneStaleTurns();
     const active = this._activeTurns.get(String(turn));
-    return !!active && (sessionId === undefined || sessionId === active.sessionId);
+    if (!active) return false;
+    if (key && active.key && active.key === key) {
+      if (sessionId && active.sessionId !== sessionId) active.sessionId = sessionId;
+      return true;
+    }
+    if (sessionId === undefined || sessionId === null || sessionId === '') {
+      return true;
+    }
+    return sessionId === active.sessionId;
+  }
+
+  hasActiveTurnForKey(key) {
+    if (!key) return false;
+    this._pruneStaleTurns();
+    for (const info of this._activeTurns.values()) {
+      if (info.key === key) return true;
+    }
+    return false;
   }
 
   isTurnCompleted(turn) {
@@ -411,13 +446,23 @@ export class AgyApiClient {
     return this._wakeWaiters.size;
   }
 
-  claimTurn(turn, sessionId, workerId) {
+  claimTurn(turn, sessionId, workerId, key = '') {
     this._pruneStaleTurns();
     const active = this._activeTurns.get(turn);
-    if (!active || active.sessionId !== sessionId || active.workerId !== workerId) return 'stale';
+    if (!active || active.workerId !== workerId) return 'stale';
+    const sessionMatched = Boolean(sessionId && active.sessionId === sessionId);
+    const keyMatched = Boolean(key && active.key && active.key === key);
+    if (!sessionMatched && !keyMatched) return 'stale';
+    if (sessionId && active.sessionId !== sessionId) {
+      active.sessionId = sessionId;
+    }
+    if (key && !active.key) {
+      active.key = key;
+    }
     if (active.claimed) return 'duplicate';
     active.claimed = true;
     active.startedAt = Date.now();
+    this._saveActiveTurns();
     return 'claimed';
   }
 
@@ -472,6 +517,9 @@ export class AgyApiClient {
       }
       completed.push({ sessionId: info.sessionId, turn: info.turn, workerId: info.workerId });
     }
+    if (completed.length > 0) {
+      this._saveActiveTurns();
+    }
     if (affectedSids.size > 0 && typeof this.onWorkerAvailable === 'function') {
       queueMicrotask(() => {
         for (const sid of affectedSids) this.onWorkerAvailable?.(sid);
@@ -500,6 +548,65 @@ export class AgyApiClient {
       const tmp = this._turnsFile + '.tmp';
       fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(this._workerTurns), null, 2), { mode: 0o600 });
       fs.renameSync(tmp, this._turnsFile);
+    } catch {}
+  }
+
+  _loadActiveTurns() {
+    try {
+      if (!fs.existsSync(this._activeTurnsFile)) return;
+      const raw = JSON.parse(fs.readFileSync(this._activeTurnsFile, 'utf8').replace(/^\uFEFF/, ''));
+      const now = Date.now();
+      const list = Array.isArray(raw?.activeTurns) ? raw.activeTurns : [];
+      for (const item of list) {
+        if (!item?.turn || !item?.sessionId) continue;
+        if (item.workerId && (now - Number(item.startedAt || 0)) > 600_000) continue;
+        const entry = {
+          sessionId: String(item.sessionId),
+          key: String(item.key || extractConvKey(item.snapshot?.text) || ''),
+          turn: String(item.turn),
+          wakeId: String(item.wakeId || randomUUID()),
+          workerId: String(item.workerId || ''),
+          claimed: Boolean(item.claimed),
+          startedAt: Number(item.startedAt) || now,
+        };
+        if (!this._sessions.has(entry.sessionId)) {
+          this._sessions.set(entry.sessionId, {
+            sessionId: entry.sessionId,
+            title: entry.key || '',
+            agentPreset: 'qq-chat-v2',
+            createdAt: new Date(entry.startedAt).toISOString(),
+          });
+        }
+        this._activeTurns.set(entry.turn, entry);
+        if (item.snapshot && typeof item.snapshot === 'object') {
+          this._snapshots.set(entry, item.snapshot);
+          if (!entry.workerId) {
+            this._wakeQueue.push(item.snapshot);
+          }
+        }
+      }
+    } catch {}
+  }
+
+  _saveActiveTurns() {
+    try {
+      fs.mkdirSync(path.dirname(this._activeTurnsFile), { recursive: true });
+      const activeTurns = [];
+      for (const info of this._activeTurns.values()) {
+        activeTurns.push({
+          sessionId: info.sessionId,
+          key: info.key || '',
+          turn: info.turn,
+          wakeId: info.wakeId,
+          workerId: info.workerId || '',
+          claimed: Boolean(info.claimed),
+          startedAt: info.startedAt,
+          snapshot: this._snapshots.get(info) || null,
+        });
+      }
+      const tmp = `${this._activeTurnsFile}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ updatedAt: Date.now(), activeTurns }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, this._activeTurnsFile);
     } catch {}
   }
 
@@ -685,6 +792,31 @@ export function createFlashJudge({
     quoteTargetIsSelf = false,
   } = {}) {
     const routerCfg = typeof getRouterConfig === 'function' ? getRouterConfig() : {};
+    // 明确 @ 助手或引用回复助手（且未写“不用回”）属于必回场景，本地 0ms 直通免去外网路由等待
+    if ((explicitAtSelf || quoteTargetIsSelf) && !/不用回|别回|勿回/.test(String(targetText || ''))) {
+      const fastDecision = {
+        ok: true,
+        degraded: false,
+        should_reply: true,
+        reason: explicitAtSelf ? '明确@助手本地零延迟直通' : '引用助手消息本地零延迟直通',
+        model: 'local-fastpath',
+        endpoint: 'fastpath',
+        latencyMs: 0,
+      };
+      totalRouted += 1;
+      lastDecision = {
+        at: new Date().toISOString(),
+        key,
+        trigger: triggerReason,
+        should_reply: true,
+        reason: fastDecision.reason,
+        model: fastDecision.model,
+        endpoint: fastDecision.endpoint,
+        degraded: false,
+        latencyMs: 0,
+      };
+      return fastDecision;
+    }
     const aliases = typeof getAssistantAliases === 'function' ? getAssistantAliases() : [];
     const selfQqId = typeof getSelfQqId === 'function' ? String(getSelfQqId() || '') : '';
     const senderIsAdmin = Boolean(senderId && (routerCfg?.ownerIdSet?.has(String(senderId)) || isCreator?.(senderId)));
